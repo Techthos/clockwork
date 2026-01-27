@@ -186,6 +186,7 @@ func (s *ClockworkServer) registerCreateEntry() {
 		mcp.WithBoolean("invoiced", mcp.Description("Whether the entry has been invoiced (default: false)")),
 		mcp.WithBoolean("manual", mcp.Description("Skip git commit aggregation (default: false)")),
 		mcp.WithString("duration", mcp.Description("Duration in format '1h 30m' or '90m' (required when manual=true, optional override otherwise)")),
+		mcp.WithString("created_at", mcp.Description("Entry creation datetime in RFC3339 format (optional, e.g., '2026-01-15T14:30:00Z')")),
 	)
 
 	s.mcp.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -199,6 +200,17 @@ func (s *ClockworkServer) registerCreateEntry() {
 		invoiced, _ := args["invoiced"].(bool)
 		manual, _ := args["manual"].(bool)
 		durationStr, _ := args["duration"].(string)
+		createdAtStr, _ := args["created_at"].(string)
+
+		// Parse created_at if provided, otherwise use current time
+		createdAt := time.Now()
+		if createdAtStr != "" {
+			parsed, err := time.Parse(time.RFC3339, createdAtStr)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("invalid created_at format (use RFC3339, e.g., '2026-01-15T14:30:00Z'): %v", err)), nil
+			}
+			createdAt = parsed
+		}
 
 		// Validate project exists
 		_, err = s.store.GetProject(projectID)
@@ -222,7 +234,7 @@ func (s *ClockworkServer) registerCreateEntry() {
 				message = "Manual entry"
 			}
 
-			entry, err := s.store.CreateEntry(projectID, duration, message, "", invoiced)
+			entry, err := s.store.CreateEntry(projectID, duration, message, "", invoiced, createdAt)
 			if err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
@@ -282,7 +294,7 @@ func (s *ClockworkServer) registerCreateEntry() {
 		}
 
 		// Create entry
-		entry, err := s.store.CreateEntry(projectID, duration, message, latestHash, invoiced)
+		entry, err := s.store.CreateEntry(projectID, duration, message, latestHash, invoiced, createdAt)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -305,6 +317,7 @@ func (s *ClockworkServer) registerUpdateEntry() {
 		mcp.WithString("message", mcp.Description("New message (optional)")),
 		mcp.WithString("commit_hash", mcp.Description("New commit hash (optional)")),
 		mcp.WithBoolean("invoiced", mcp.Description("Update invoiced status (optional)")),
+		mcp.WithString("created_at", mcp.Description("Update entry creation datetime in RFC3339 format (optional, e.g., '2026-01-15T14:30:00Z')")),
 	)
 
 	s.mcp.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -317,6 +330,7 @@ func (s *ClockworkServer) registerUpdateEntry() {
 		var duration *int64
 		var message, commitHash *string
 		var invoiced *bool
+		var createdAt *time.Time
 
 		// Parse duration_string first (takes priority over numeric duration)
 		if durationStr, ok := args["duration_string"].(string); ok && durationStr != "" {
@@ -340,7 +354,16 @@ func (s *ClockworkServer) registerUpdateEntry() {
 			invoiced = &i
 		}
 
-		entry, err := s.store.UpdateEntry(id, duration, message, commitHash, invoiced)
+		// Parse created_at if provided
+		if createdAtStr, ok := args["created_at"].(string); ok && createdAtStr != "" {
+			parsed, err := time.Parse(time.RFC3339, createdAtStr)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("invalid created_at format (use RFC3339, e.g., '2026-01-15T14:30:00Z'): %v", err)), nil
+			}
+			createdAt = &parsed
+		}
+
+		entry, err := s.store.UpdateEntry(id, duration, message, commitHash, invoiced, createdAt)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}

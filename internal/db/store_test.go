@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func setupTestDB(t *testing.T) (*Store, string) {
@@ -101,7 +102,7 @@ func TestCreateAndGetEntry(t *testing.T) {
 
 	project, _ := store.CreateProject("Test", "/path")
 
-	entry, err := store.CreateEntry(project.ID, 120, "Test work", "abc123", false)
+	entry, err := store.CreateEntry(project.ID, 120, "Test work", "abc123", false, time.Now())
 	if err != nil {
 		t.Fatalf("Failed to create entry: %v", err)
 	}
@@ -125,13 +126,13 @@ func TestUpdateEntry(t *testing.T) {
 	defer store.Close()
 
 	project, _ := store.CreateProject("Test", "/path")
-	entry, _ := store.CreateEntry(project.ID, 60, "Original", "abc", false)
+	entry, _ := store.CreateEntry(project.ID, 60, "Original", "abc", false, time.Now())
 
 	newDuration := int64(120)
 	newMessage := "Updated"
 	invoiced := true
 
-	updated, err := store.UpdateEntry(entry.ID, &newDuration, &newMessage, nil, &invoiced)
+	updated, err := store.UpdateEntry(entry.ID, &newDuration, &newMessage, nil, &invoiced, nil)
 	if err != nil {
 		t.Fatalf("Failed to update entry: %v", err)
 	}
@@ -154,8 +155,8 @@ func TestListEntries(t *testing.T) {
 	defer store.Close()
 
 	project, _ := store.CreateProject("Test", "/path")
-	store.CreateEntry(project.ID, 60, "Entry 1", "abc", false)
-	store.CreateEntry(project.ID, 90, "Entry 2", "def", false)
+	store.CreateEntry(project.ID, 60, "Entry 1", "abc", false, time.Now())
+	store.CreateEntry(project.ID, 90, "Entry 2", "def", false, time.Now())
 
 	entries, err := store.ListEntries(project.ID)
 	if err != nil {
@@ -183,8 +184,8 @@ func TestGetLastEntry(t *testing.T) {
 	}
 
 	// Add entries
-	store.CreateEntry(project.ID, 60, "Entry 1", "abc", false)
-	entry2, _ := store.CreateEntry(project.ID, 90, "Entry 2", "def", false)
+	store.CreateEntry(project.ID, 60, "Entry 1", "abc", false, time.Now())
+	entry2, _ := store.CreateEntry(project.ID, 90, "Entry 2", "def", false, time.Now())
 
 	last, err = store.GetLastEntry(project.ID)
 	if err != nil {
@@ -231,8 +232,8 @@ func TestDeleteProjectCascade(t *testing.T) {
 	defer store.Close()
 
 	project, _ := store.CreateProject("Test", "/path")
-	store.CreateEntry(project.ID, 60, "Entry 1", "abc", false)
-	store.CreateEntry(project.ID, 90, "Entry 2", "def", false)
+	store.CreateEntry(project.ID, 60, "Entry 1", "abc", false, time.Now())
+	store.CreateEntry(project.ID, 90, "Entry 2", "def", false, time.Now())
 
 	err := store.DeleteProject(project.ID)
 	if err != nil {
@@ -257,10 +258,10 @@ func TestListEntriesFiltered(t *testing.T) {
 	project2, _ := store.CreateProject("Project 2", "/path/2")
 
 	// Create entries with different invoiced statuses
-	store.CreateEntry(project1.ID, 60, "Entry 1 - Not Invoiced", "abc", false)
-	store.CreateEntry(project1.ID, 90, "Entry 2 - Invoiced", "def", true)
-	store.CreateEntry(project2.ID, 120, "Entry 3 - Not Invoiced", "ghi", false)
-	store.CreateEntry(project2.ID, 150, "Entry 4 - Invoiced", "jkl", true)
+	store.CreateEntry(project1.ID, 60, "Entry 1 - Not Invoiced", "abc", false, time.Now())
+	store.CreateEntry(project1.ID, 90, "Entry 2 - Invoiced", "def", true, time.Now())
+	store.CreateEntry(project2.ID, 120, "Entry 3 - Not Invoiced", "ghi", false, time.Now())
+	store.CreateEntry(project2.ID, 150, "Entry 4 - Invoiced", "jkl", true, time.Now())
 
 	// Test: List all entries (no filters)
 	allEntries, err := store.ListEntriesFiltered("", nil)
@@ -327,10 +328,10 @@ func TestGetStatistics(t *testing.T) {
 	project2, _ := store.CreateProject("Project 2", "/path/2")
 
 	// Create entries with different properties
-	store.CreateEntry(project1.ID, 60, "Entry 1", "abc", false)   // 1 hour, not invoiced
-	store.CreateEntry(project1.ID, 90, "Entry 2", "def", true)    // 1.5 hours, invoiced
-	store.CreateEntry(project2.ID, 120, "Entry 3", "ghi", false)  // 2 hours, not invoiced
-	store.CreateEntry(project2.ID, 150, "Entry 4", "jkl", true)   // 2.5 hours, invoiced
+	store.CreateEntry(project1.ID, 60, "Entry 1", "abc", false, time.Now())   // 1 hour, not invoiced
+	store.CreateEntry(project1.ID, 90, "Entry 2", "def", true, time.Now())    // 1.5 hours, invoiced
+	store.CreateEntry(project2.ID, 120, "Entry 3", "ghi", false, time.Now())  // 2 hours, not invoiced
+	store.CreateEntry(project2.ID, 150, "Entry 4", "jkl", true, time.Now())   // 2.5 hours, invoiced
 
 	// Test: All statistics (no filters)
 	stats, err := store.GetStatistics("", nil, nil, nil)
@@ -422,6 +423,75 @@ func TestGetStatistics(t *testing.T) {
 
 	if stats.LatestEntry == nil {
 		t.Error("Expected latest entry to be set")
+	}
+}
+
+func TestCreateEntryWithCustomDate(t *testing.T) {
+	store, _ := setupTestDB(t)
+	defer store.Close()
+
+	project, _ := store.CreateProject("Test", "/path")
+
+	// Create entry with custom date
+	customDate := time.Date(2025, 12, 15, 14, 30, 0, 0, time.UTC)
+	entry, err := store.CreateEntry(project.ID, 120, "Custom date entry", "abc123", false, customDate)
+	if err != nil {
+		t.Fatalf("Failed to create entry with custom date: %v", err)
+	}
+
+	// Verify the custom date was set correctly
+	if !entry.CreatedAt.Equal(customDate) {
+		t.Errorf("Expected CreatedAt %v, got %v", customDate, entry.CreatedAt)
+	}
+
+	// Retrieve and verify
+	retrieved, err := store.GetEntry(entry.ID)
+	if err != nil {
+		t.Fatalf("Failed to retrieve entry: %v", err)
+	}
+
+	if !retrieved.CreatedAt.Equal(customDate) {
+		t.Errorf("Expected retrieved CreatedAt %v, got %v", customDate, retrieved.CreatedAt)
+	}
+}
+
+func TestUpdateEntryWithCustomDate(t *testing.T) {
+	store, _ := setupTestDB(t)
+	defer store.Close()
+
+	project, _ := store.CreateProject("Test", "/path")
+
+	// Create entry with current time
+	originalDate := time.Now()
+	entry, _ := store.CreateEntry(project.ID, 60, "Original entry", "abc", false, originalDate)
+
+	// Update with custom date
+	newDate := time.Date(2025, 11, 20, 10, 15, 0, 0, time.UTC)
+	updated, err := store.UpdateEntry(entry.ID, nil, nil, nil, nil, &newDate)
+	if err != nil {
+		t.Fatalf("Failed to update entry with custom date: %v", err)
+	}
+
+	// Verify the date was updated
+	if !updated.CreatedAt.Equal(newDate) {
+		t.Errorf("Expected CreatedAt %v, got %v", newDate, updated.CreatedAt)
+	}
+
+	// Update without changing the date (nil parameter)
+	newMessage := "Updated message"
+	updated2, err := store.UpdateEntry(entry.ID, nil, &newMessage, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Failed to update entry: %v", err)
+	}
+
+	// Verify date remained unchanged
+	if !updated2.CreatedAt.Equal(newDate) {
+		t.Errorf("Expected CreatedAt to remain %v, got %v", newDate, updated2.CreatedAt)
+	}
+
+	// Verify message was updated
+	if updated2.Message != "Updated message" {
+		t.Errorf("Expected message 'Updated message', got '%s'", updated2.Message)
 	}
 }
 

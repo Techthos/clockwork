@@ -195,7 +195,7 @@ func (s *Store) ListProjects() ([]*models.Project, error) {
 }
 
 // CreateEntry creates a new worklog entry
-func (s *Store) CreateEntry(projectID string, duration int64, message, commitHash string, invoiced bool) (*models.Entry, error) {
+func (s *Store) CreateEntry(projectID string, duration int64, message, commitHash string, invoiced bool, createdAt time.Time) (*models.Entry, error) {
 	// Verify project exists
 	if _, err := s.GetProject(projectID); err != nil {
 		return nil, fmt.Errorf("project not found: %w", err)
@@ -208,7 +208,7 @@ func (s *Store) CreateEntry(projectID string, duration int64, message, commitHas
 		Message:    message,
 		CommitHash: commitHash,
 		Invoiced:   invoiced,
-		CreatedAt:  time.Now(),
+		CreatedAt:  createdAt,
 		UpdatedAt:  time.Now(),
 	}
 
@@ -249,7 +249,7 @@ func (s *Store) GetEntry(id string) (*models.Entry, error) {
 }
 
 // UpdateEntry updates an existing entry
-func (s *Store) UpdateEntry(id string, duration *int64, message, commitHash *string, invoiced *bool) (*models.Entry, error) {
+func (s *Store) UpdateEntry(id string, duration *int64, message, commitHash *string, invoiced *bool, createdAt *time.Time) (*models.Entry, error) {
 	var entry models.Entry
 
 	err := s.db.Update(func(tx *bolt.Tx) error {
@@ -274,6 +274,9 @@ func (s *Store) UpdateEntry(id string, duration *int64, message, commitHash *str
 		}
 		if invoiced != nil {
 			entry.Invoiced = *invoiced
+		}
+		if createdAt != nil {
+			entry.CreatedAt = *createdAt
 		}
 		entry.UpdatedAt = time.Now()
 
