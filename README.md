@@ -252,4 +252,4 @@ Contributions welcome! Please open an issue or pull request.
 
 ---
 
-**Made with ⚙️ by the Clockwork team**
+**Made with ⚙️ by the Techthos team**
