@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/techthos/clockwork/internal/db"
 	"github.com/techthos/clockwork/internal/git"
+	"github.com/techthos/clockwork/internal/utils"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -27,7 +29,7 @@ func New() (*ClockworkServer, error) {
 		return nil, fmt.Errorf("failed to get home directory: %w", err)
 	}
 
-	dbPath := filepath.Join(homeDir, ".local", "time-track", "db")
+	dbPath := filepath.Join(homeDir, ".local", "clockwork", "default.db")
 	store, err := db.New(dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize database: %w", err)
@@ -82,6 +84,7 @@ func (s *ClockworkServer) registerTools() {
 	s.registerUpdateEntry()
 	s.registerDeleteEntry()
 	s.registerListEntries()
+	s.registerGetStatistics()
 }
 
 func (s *ClockworkServer) registerCreateProject() {
@@ -177,10 +180,12 @@ func (s *ClockworkServer) registerListProjects() {
 
 func (s *ClockworkServer) registerCreateEntry() {
 	tool := mcp.NewTool("create_entry",
-		mcp.WithDescription("Create a worklog entry with automatic commit aggregation"),
+		mcp.WithDescription("Create a worklog entry with automatic commit aggregation or manual entry"),
 		mcp.WithString("project_id", mcp.Required(), mcp.Description("Project ID")),
 		mcp.WithString("message", mcp.Description("Custom message (optional, will auto-generate from commits if not provided)")),
 		mcp.WithBoolean("invoiced", mcp.Description("Whether the entry has been invoiced (default: false)")),
+		mcp.WithBoolean("manual", mcp.Description("Skip git commit aggregation (default: false)")),
+		mcp.WithString("duration", mcp.Description("Duration in format '1h 30m' or '90m' (required when manual=true, optional override otherwise)")),
 	)
 
 	s.mcp.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -192,12 +197,45 @@ func (s *ClockworkServer) registerCreateEntry() {
 
 		customMessage, _ := args["message"].(string)
 		invoiced, _ := args["invoiced"].(bool)
+		manual, _ := args["manual"].(bool)
+		durationStr, _ := args["duration"].(string)
 
-		// Get project
-		project, err := s.store.GetProject(projectID)
+		// Validate project exists
+		_, err = s.store.GetProject(projectID)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("project not found: %v", err)), nil
 		}
+
+		// Manual entry path
+		if manual {
+			if durationStr == "" {
+				return mcp.NewToolResultError("duration is required when manual=true"), nil
+			}
+
+			duration, err := utils.ParseDuration(durationStr)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("invalid duration: %v", err)), nil
+			}
+
+			message := customMessage
+			if message == "" {
+				message = "Manual entry"
+			}
+
+			entry, err := s.store.CreateEntry(projectID, duration, message, "", invoiced)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+
+			result, _ := json.MarshalIndent(map[string]interface{}{
+				"entry": entry,
+				"mode":  "manual",
+			}, "", "  ")
+			return mcp.NewToolResultText(string(result)), nil
+		}
+
+		// Git-based entry path
+		project, _ := s.store.GetProject(projectID)
 
 		// Get last entry to determine since commit
 		lastEntry, err := s.store.GetLastEntry(projectID)
@@ -226,8 +264,18 @@ func (s *ClockworkServer) registerCreateEntry() {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		// Calculate duration and generate message
-		duration := git.CalculateDuration(commits)
+		// Calculate duration (use override if provided)
+		var duration int64
+		if durationStr != "" {
+			duration, err = utils.ParseDuration(durationStr)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("invalid duration: %v", err)), nil
+			}
+		} else {
+			duration = git.CalculateDuration(commits)
+		}
+
+		// Generate message
 		message := customMessage
 		if message == "" {
 			message = git.AggregateCommits(commits)
@@ -242,6 +290,7 @@ func (s *ClockworkServer) registerCreateEntry() {
 		result, _ := json.MarshalIndent(map[string]interface{}{
 			"entry":         entry,
 			"commits_found": len(commits),
+			"mode":          "git",
 		}, "", "  ")
 		return mcp.NewToolResultText(string(result)), nil
 	})
@@ -252,6 +301,7 @@ func (s *ClockworkServer) registerUpdateEntry() {
 		mcp.WithDescription("Update an existing worklog entry"),
 		mcp.WithString("id", mcp.Required(), mcp.Description("Entry ID")),
 		mcp.WithNumber("duration", mcp.Description("New duration in minutes (optional)")),
+		mcp.WithString("duration_string", mcp.Description("Duration in format '1h 30m' or '90m' (overrides numeric duration)")),
 		mcp.WithString("message", mcp.Description("New message (optional)")),
 		mcp.WithString("commit_hash", mcp.Description("New commit hash (optional)")),
 		mcp.WithBoolean("invoiced", mcp.Description("Update invoiced status (optional)")),
@@ -268,10 +318,18 @@ func (s *ClockworkServer) registerUpdateEntry() {
 		var message, commitHash *string
 		var invoiced *bool
 
-		if d, ok := args["duration"].(float64); ok {
+		// Parse duration_string first (takes priority over numeric duration)
+		if durationStr, ok := args["duration_string"].(string); ok && durationStr != "" {
+			parsed, err := utils.ParseDuration(durationStr)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("invalid duration_string: %v", err)), nil
+			}
+			duration = &parsed
+		} else if d, ok := args["duration"].(float64); ok {
 			dInt := int64(d)
 			duration = &dInt
 		}
+
 		if m, ok := args["message"].(string); ok {
 			message = &m
 		}
@@ -314,22 +372,95 @@ func (s *ClockworkServer) registerDeleteEntry() {
 
 func (s *ClockworkServer) registerListEntries() {
 	tool := mcp.NewTool("list_entries",
-		mcp.WithDescription("List all entries for a project"),
-		mcp.WithString("project_id", mcp.Required(), mcp.Description("Project ID")),
+		mcp.WithDescription("List entries with optional filtering"),
+		mcp.WithString("project_id", mcp.Description("Project ID (optional, omit for all projects)")),
+		mcp.WithString("invoiced", mcp.Description("Filter: 'true', 'false', or 'all' (default: 'all')")),
 	)
 
 	s.mcp.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		projectID, err := getRequiredString(request, "project_id")
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+		args := request.Params.Arguments
+
+		projectID, _ := args["project_id"].(string)
+		invoicedStr, _ := args["invoiced"].(string)
+
+		var invoicedFilter *bool
+		if invoicedStr == "true" {
+			val := true
+			invoicedFilter = &val
+		} else if invoicedStr == "false" {
+			val := false
+			invoicedFilter = &val
 		}
 
-		entries, err := s.store.ListEntries(projectID)
+		entries, err := s.store.ListEntriesFiltered(projectID, invoicedFilter)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
 		result, _ := json.MarshalIndent(entries, "", "  ")
+		return mcp.NewToolResultText(string(result)), nil
+	})
+}
+
+func (s *ClockworkServer) registerGetStatistics() {
+	tool := mcp.NewTool("get_statistics",
+		mcp.WithDescription("Get aggregated time tracking statistics"),
+		mcp.WithString("project_id", mcp.Description("Filter by project (optional)")),
+		mcp.WithString("start_date", mcp.Description("RFC3339 format (optional, e.g., '2026-01-01T00:00:00Z')")),
+		mcp.WithString("end_date", mcp.Description("RFC3339 format (optional)")),
+		mcp.WithString("invoiced", mcp.Description("Filter: 'true', 'false', or 'all' (default: 'all')")),
+	)
+
+	s.mcp.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args := request.Params.Arguments
+
+		projectID, _ := args["project_id"].(string)
+		startDateStr, _ := args["start_date"].(string)
+		endDateStr, _ := args["end_date"].(string)
+		invoicedStr, _ := args["invoiced"].(string)
+
+		// Parse start date
+		var startDate *time.Time
+		if startDateStr != "" {
+			parsed, err := time.Parse(time.RFC3339, startDateStr)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("invalid start_date format (use RFC3339): %v", err)), nil
+			}
+			startDate = &parsed
+		}
+
+		// Parse end date
+		var endDate *time.Time
+		if endDateStr != "" {
+			parsed, err := time.Parse(time.RFC3339, endDateStr)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("invalid end_date format (use RFC3339): %v", err)), nil
+			}
+			endDate = &parsed
+		}
+
+		// Validate date range
+		if startDate != nil && endDate != nil && startDate.After(*endDate) {
+			return mcp.NewToolResultError("start_date must be before end_date"), nil
+		}
+
+		// Parse invoiced filter
+		var invoicedFilter *bool
+		if invoicedStr == "true" {
+			val := true
+			invoicedFilter = &val
+		} else if invoicedStr == "false" {
+			val := false
+			invoicedFilter = &val
+		}
+
+		// Get statistics
+		stats, err := s.store.GetStatistics(projectID, startDate, endDate, invoicedFilter)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		result, _ := json.MarshalIndent(stats, "", "  ")
 		return mcp.NewToolResultText(string(result)), nil
 	})
 }

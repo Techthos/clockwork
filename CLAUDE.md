@@ -65,7 +65,7 @@ Edit `~/.claude/config.json`:
 
 **Note:** Use the absolute path to the binary. If you ran `go install`, the binary is at `$(go env GOPATH)/bin/clockwork` (typically `~/go/bin/clockwork`).
 
-The server auto-creates its database at `~/.local/time-track/db` on first run.
+The server auto-creates its database at `~/.local/clockwork/default.db` on first run.
 
 ## Architecture
 
@@ -94,7 +94,7 @@ The core workflow aggregates git commits into worklog entries:
 
 ### Database Layer
 
-**bbolt** key-value store at `~/.local/time-track/db`:
+**bbolt** key-value store at `~/.local/clockwork/default.db`:
 
 - Two buckets: `projects` and `entries`
 - All operations wrapped in transactions (`db.Update`, `db.View`)
@@ -117,7 +117,7 @@ The core workflow aggregates git commits into worklog entries:
 ### MCP Server Initialization
 
 Entry point (`cmd/clockwork/main.go`) → `server.New()`:
-1. Resolves `~/.local/time-track/db` path
+1. Resolves `~/.local/clockwork/default.db` path
 2. Calls `db.New()` to initialize bbolt store
 3. Creates `server.MCPServer` instance ("clockwork", "1.0.0")
 4. Registers all 8 tools via `registerTools()`
@@ -145,7 +145,7 @@ Entry point (`cmd/clockwork/main.go`) → `server.New()`:
 
 ## Database Location
 
-Production: `~/.local/time-track/db`
+Production: `~/.local/clockwork/default.db`
 Tests: `t.TempDir()/<testname>.db`
 
 Only one instance can hold the database lock at a time (bbolt limitation).

@@ -48,7 +48,7 @@ Add to your MCP client configuration (e.g., Claude Desktop):
 }
 ```
 
-The server will automatically create its database at `~/.local/time-track/db`.
+The server will automatically create its database at `~/.local/clockwork/default.db`.
 
 ## Usage
 
@@ -163,7 +163,7 @@ Example: If you have commits at 9:00 AM and 11:30 AM, the calculated duration is
 
 Clockwork uses **bbolt**, a pure Go embedded key-value database:
 
-- **Location**: `~/.local/time-track/db`
+- **Location**: `~/.local/clockwork/default.db`
 - **Format**: Single file, no external dependencies
 - **Buckets**: `projects` and `entries`
 - **Persistence**: All data persists between runs

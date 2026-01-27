@@ -346,3 +346,124 @@ func (s *Store) GetLastEntry(projectID string) (*models.Entry, error) {
 
 	return latest, nil
 }
+
+// ListEntriesFiltered returns entries with optional filtering
+func (s *Store) ListEntriesFiltered(projectID string, invoicedFilter *bool) ([]*models.Entry, error) {
+	var entries []*models.Entry
+
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(entriesBucket))
+		if b == nil {
+			return nil
+		}
+
+		return b.ForEach(func(k, v []byte) error {
+			var entry models.Entry
+			if err := json.Unmarshal(v, &entry); err != nil {
+				return err
+			}
+
+			// Filter by project (empty = all projects)
+			if projectID != "" && entry.ProjectID != projectID {
+				return nil
+			}
+
+			// Filter by invoiced status (nil = all entries)
+			if invoicedFilter != nil && entry.Invoiced != *invoicedFilter {
+				return nil
+			}
+
+			entries = append(entries, &entry)
+			return nil
+		})
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return entries, nil
+}
+
+// Statistics represents aggregated entry statistics
+type Statistics struct {
+	TotalMinutes      int64            `json:"total_minutes"`
+	TotalHours        float64          `json:"total_hours"`
+	EntryCount        int              `json:"entry_count"`
+	InvoicedMinutes   int64            `json:"invoiced_minutes"`
+	UninvoicedMinutes int64            `json:"uninvoiced_minutes"`
+	ProjectBreakdown  map[string]int64 `json:"project_breakdown"` // projectID -> minutes
+	EarliestEntry     *time.Time       `json:"earliest_entry,omitempty"`
+	LatestEntry       *time.Time       `json:"latest_entry,omitempty"`
+}
+
+// GetStatistics calculates aggregated statistics with optional filtering
+func (s *Store) GetStatistics(projectID string, startDate, endDate *time.Time, invoicedFilter *bool) (*Statistics, error) {
+	stats := &Statistics{
+		ProjectBreakdown: make(map[string]int64),
+	}
+
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(entriesBucket))
+		if b == nil {
+			return nil
+		}
+
+		return b.ForEach(func(k, v []byte) error {
+			var entry models.Entry
+			if err := json.Unmarshal(v, &entry); err != nil {
+				return err
+			}
+
+			// Filter by project (empty = all projects)
+			if projectID != "" && entry.ProjectID != projectID {
+				return nil
+			}
+
+			// Filter by date range
+			if startDate != nil && entry.CreatedAt.Before(*startDate) {
+				return nil
+			}
+			if endDate != nil && entry.CreatedAt.After(*endDate) {
+				return nil
+			}
+
+			// Filter by invoiced status (nil = all entries)
+			if invoicedFilter != nil && entry.Invoiced != *invoicedFilter {
+				return nil
+			}
+
+			// Aggregate statistics
+			stats.TotalMinutes += entry.Duration
+			stats.EntryCount++
+
+			if entry.Invoiced {
+				stats.InvoicedMinutes += entry.Duration
+			} else {
+				stats.UninvoicedMinutes += entry.Duration
+			}
+
+			// Project breakdown
+			stats.ProjectBreakdown[entry.ProjectID] += entry.Duration
+
+			// Track earliest and latest entries
+			if stats.EarliestEntry == nil || entry.CreatedAt.Before(*stats.EarliestEntry) {
+				earliestTime := entry.CreatedAt
+				stats.EarliestEntry = &earliestTime
+			}
+			if stats.LatestEntry == nil || entry.CreatedAt.After(*stats.LatestEntry) {
+				latestTime := entry.CreatedAt
+				stats.LatestEntry = &latestTime
+			}
+
+			return nil
+		})
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	stats.TotalHours = float64(stats.TotalMinutes) / 60.0
+	return stats, nil
+}
