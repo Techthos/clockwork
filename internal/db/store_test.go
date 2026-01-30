@@ -264,7 +264,7 @@ func TestListEntriesFiltered(t *testing.T) {
 	store.CreateEntry(project2.ID, 150, "Entry 4 - Invoiced", "jkl", true, time.Now())
 
 	// Test: List all entries (no filters)
-	allEntries, err := store.ListEntriesFiltered("", nil)
+	allEntries, err := store.ListEntriesFiltered("", nil, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to list all entries: %v", err)
 	}
@@ -273,7 +273,7 @@ func TestListEntriesFiltered(t *testing.T) {
 	}
 
 	// Test: List all entries for project 1
-	project1Entries, err := store.ListEntriesFiltered(project1.ID, nil)
+	project1Entries, err := store.ListEntriesFiltered(project1.ID, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to list project 1 entries: %v", err)
 	}
@@ -283,7 +283,7 @@ func TestListEntriesFiltered(t *testing.T) {
 
 	// Test: List all invoiced entries
 	invoicedTrue := true
-	invoicedEntries, err := store.ListEntriesFiltered("", &invoicedTrue)
+	invoicedEntries, err := store.ListEntriesFiltered("", nil, nil, &invoicedTrue)
 	if err != nil {
 		t.Fatalf("Failed to list invoiced entries: %v", err)
 	}
@@ -293,7 +293,7 @@ func TestListEntriesFiltered(t *testing.T) {
 
 	// Test: List all not invoiced entries
 	invoicedFalse := false
-	notInvoicedEntries, err := store.ListEntriesFiltered("", &invoicedFalse)
+	notInvoicedEntries, err := store.ListEntriesFiltered("", nil, nil, &invoicedFalse)
 	if err != nil {
 		t.Fatalf("Failed to list not invoiced entries: %v", err)
 	}
@@ -302,7 +302,7 @@ func TestListEntriesFiltered(t *testing.T) {
 	}
 
 	// Test: List not invoiced entries for project 1
-	project1NotInvoiced, err := store.ListEntriesFiltered(project1.ID, &invoicedFalse)
+	project1NotInvoiced, err := store.ListEntriesFiltered(project1.ID, nil, nil, &invoicedFalse)
 	if err != nil {
 		t.Fatalf("Failed to list project 1 not invoiced entries: %v", err)
 	}
@@ -311,12 +311,114 @@ func TestListEntriesFiltered(t *testing.T) {
 	}
 
 	// Test: List invoiced entries for project 2
-	project2Invoiced, err := store.ListEntriesFiltered(project2.ID, &invoicedTrue)
+	project2Invoiced, err := store.ListEntriesFiltered(project2.ID, nil, nil, &invoicedTrue)
 	if err != nil {
 		t.Fatalf("Failed to list project 2 invoiced entries: %v", err)
 	}
 	if len(project2Invoiced) != 1 {
 		t.Errorf("Expected 1 invoiced entry for project 2, got %d", len(project2Invoiced))
+	}
+}
+
+func TestListEntriesFilteredByDateRange(t *testing.T) {
+	store, _ := setupTestDB(t)
+	defer store.Close()
+
+	project1, _ := store.CreateProject("Project 1", "/path/1")
+	project2, _ := store.CreateProject("Project 2", "/path/2")
+
+	// Create entries with specific dates
+	jan1 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	jan15 := time.Date(2026, 1, 15, 10, 0, 0, 0, time.UTC)
+	jan31 := time.Date(2026, 1, 31, 10, 0, 0, 0, time.UTC)
+	feb15 := time.Date(2026, 2, 15, 10, 0, 0, 0, time.UTC)
+	mar1 := time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
+
+	store.CreateEntry(project1.ID, 60, "Jan 1 Entry", "abc", false, jan1)
+	store.CreateEntry(project1.ID, 90, "Jan 15 Entry", "def", true, jan15)
+	store.CreateEntry(project2.ID, 120, "Jan 31 Entry", "ghi", false, jan31)
+	store.CreateEntry(project2.ID, 150, "Feb 15 Entry", "jkl", true, feb15)
+	store.CreateEntry(project1.ID, 180, "Mar 1 Entry", "mno", false, mar1)
+
+	// Test: List all entries in January
+	janStart := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	janEnd := time.Date(2026, 1, 31, 23, 59, 59, 0, time.UTC)
+	janEntries, err := store.ListEntriesFiltered("", &janStart, &janEnd, nil)
+	if err != nil {
+		t.Fatalf("Failed to list January entries: %v", err)
+	}
+	if len(janEntries) != 3 {
+		t.Errorf("Expected 3 entries in January, got %d", len(janEntries))
+	}
+
+	// Test: List entries from Jan 15 onwards
+	jan15Start := time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)
+	laterEntries, err := store.ListEntriesFiltered("", &jan15Start, nil, nil)
+	if err != nil {
+		t.Fatalf("Failed to list entries from Jan 15: %v", err)
+	}
+	if len(laterEntries) != 4 {
+		t.Errorf("Expected 4 entries from Jan 15 onwards, got %d", len(laterEntries))
+	}
+
+	// Test: List entries until end of January
+	earlierEntries, err := store.ListEntriesFiltered("", nil, &janEnd, nil)
+	if err != nil {
+		t.Fatalf("Failed to list entries until Jan 31: %v", err)
+	}
+	if len(earlierEntries) != 3 {
+		t.Errorf("Expected 3 entries until Jan 31, got %d", len(earlierEntries))
+	}
+
+	// Test: List entries for specific date range (mid-Jan to mid-Feb)
+	midJan := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
+	midFeb := time.Date(2026, 2, 20, 0, 0, 0, 0, time.UTC)
+	midEntries, err := store.ListEntriesFiltered("", &midJan, &midFeb, nil)
+	if err != nil {
+		t.Fatalf("Failed to list mid-range entries: %v", err)
+	}
+	if len(midEntries) != 3 {
+		t.Errorf("Expected 3 entries in mid-Jan to mid-Feb range, got %d", len(midEntries))
+	}
+
+	// Test: Combine date range with project filter
+	project1JanEntries, err := store.ListEntriesFiltered(project1.ID, &janStart, &janEnd, nil)
+	if err != nil {
+		t.Fatalf("Failed to list project 1 January entries: %v", err)
+	}
+	if len(project1JanEntries) != 2 {
+		t.Errorf("Expected 2 entries for project 1 in January, got %d", len(project1JanEntries))
+	}
+
+	// Test: Combine date range with invoiced filter
+	invoicedTrue := true
+	invoicedJanEntries, err := store.ListEntriesFiltered("", &janStart, &janEnd, &invoicedTrue)
+	if err != nil {
+		t.Fatalf("Failed to list invoiced January entries: %v", err)
+	}
+	if len(invoicedJanEntries) != 1 {
+		t.Errorf("Expected 1 invoiced entry in January, got %d", len(invoicedJanEntries))
+	}
+
+	// Test: All filters combined (project + date range + invoiced status)
+	invoicedFalse := false
+	combinedEntries, err := store.ListEntriesFiltered(project1.ID, &janStart, &janEnd, &invoicedFalse)
+	if err != nil {
+		t.Fatalf("Failed to list combined filtered entries: %v", err)
+	}
+	if len(combinedEntries) != 1 {
+		t.Errorf("Expected 1 entry for project 1, not invoiced, in January, got %d", len(combinedEntries))
+	}
+
+	// Test: Date range with no matching entries
+	futureStart := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
+	futureEnd := time.Date(2027, 12, 31, 0, 0, 0, 0, time.UTC)
+	futureEntries, err := store.ListEntriesFiltered("", &futureStart, &futureEnd, nil)
+	if err != nil {
+		t.Fatalf("Failed to list future entries: %v", err)
+	}
+	if len(futureEntries) != 0 {
+		t.Errorf("Expected 0 entries in future date range, got %d", len(futureEntries))
 	}
 }
 

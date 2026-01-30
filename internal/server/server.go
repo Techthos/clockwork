@@ -424,6 +424,8 @@ func (s *ClockworkServer) registerListEntries() {
 	tool := mcp.NewTool("list_entries",
 		mcp.WithDescription("List entries with optional filtering"),
 		mcp.WithString("project_id", mcp.Description("Project ID (optional, omit for all projects)")),
+		mcp.WithString("start_date", mcp.Description("RFC3339 format (optional, e.g., '2026-01-01T00:00:00Z')")),
+		mcp.WithString("end_date", mcp.Description("RFC3339 format (optional)")),
 		mcp.WithString("invoiced", mcp.Description("Filter: 'true', 'false', or 'all' (default: 'all')")),
 	)
 
@@ -431,8 +433,36 @@ func (s *ClockworkServer) registerListEntries() {
 		args, _ := request.Params.Arguments.(map[string]interface{})
 
 		projectID, _ := args["project_id"].(string)
+		startDateStr, _ := args["start_date"].(string)
+		endDateStr, _ := args["end_date"].(string)
 		invoicedStr, _ := args["invoiced"].(string)
 
+		// Parse start date
+		var startDate *time.Time
+		if startDateStr != "" {
+			parsed, err := time.Parse(time.RFC3339, startDateStr)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("invalid start_date format (use RFC3339): %v", err)), nil
+			}
+			startDate = &parsed
+		}
+
+		// Parse end date
+		var endDate *time.Time
+		if endDateStr != "" {
+			parsed, err := time.Parse(time.RFC3339, endDateStr)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("invalid end_date format (use RFC3339): %v", err)), nil
+			}
+			endDate = &parsed
+		}
+
+		// Validate date range
+		if startDate != nil && endDate != nil && startDate.After(*endDate) {
+			return mcp.NewToolResultError("start_date must be before end_date"), nil
+		}
+
+		// Parse invoiced filter
 		var invoicedFilter *bool
 		if invoicedStr == "true" {
 			val := true
@@ -442,7 +472,7 @@ func (s *ClockworkServer) registerListEntries() {
 			invoicedFilter = &val
 		}
 
-		entries, err := s.store.ListEntriesFiltered(projectID, invoicedFilter)
+		entries, err := s.store.ListEntriesFiltered(projectID, startDate, endDate, invoicedFilter)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}

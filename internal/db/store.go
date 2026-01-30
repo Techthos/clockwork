@@ -351,7 +351,7 @@ func (s *Store) GetLastEntry(projectID string) (*models.Entry, error) {
 }
 
 // ListEntriesFiltered returns entries with optional filtering
-func (s *Store) ListEntriesFiltered(projectID string, invoicedFilter *bool) ([]*models.Entry, error) {
+func (s *Store) ListEntriesFiltered(projectID string, startDate, endDate *time.Time, invoicedFilter *bool) ([]*models.Entry, error) {
 	var entries []*models.Entry
 
 	err := s.db.View(func(tx *bolt.Tx) error {
@@ -368,6 +368,14 @@ func (s *Store) ListEntriesFiltered(projectID string, invoicedFilter *bool) ([]*
 
 			// Filter by project (empty = all projects)
 			if projectID != "" && entry.ProjectID != projectID {
+				return nil
+			}
+
+			// Filter by date range
+			if startDate != nil && entry.CreatedAt.Before(*startDate) {
+				return nil
+			}
+			if endDate != nil && entry.CreatedAt.After(*endDate) {
 				return nil
 			}
 
