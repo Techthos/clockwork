@@ -4,11 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Clockwork is an MCP (Model Context Protocol) server that automatically tracks work time based on git commits. It aggregates commits into worklog entries and calculates durations.
+Clockwork is a dual-mode time tracking system that automatically tracks work time based on git commits:
+
+1. **MCP Server Mode** - Exposes time tracking as MCP tools for integration with Claude and other LLM applications
+2. **TUI Mode** - Interactive terminal user interface for direct interaction with keyboard navigation
+
+Both modes share the same embedded bbolt database and business logic.
 
 **Module Path:** `github.com/techthos/clockwork`
 
-## Build and Test Commands
+## Build and Run Commands
 
 ```bash
 # Build binary
@@ -16,6 +21,12 @@ go build -o clockwork ./cmd/clockwork
 
 # Install to GOPATH/bin
 go install ./cmd/clockwork
+
+# Run MCP server mode (default)
+./clockwork
+
+# Run TUI mode
+./clockwork tui
 
 # Run all tests
 go test ./...
@@ -26,6 +37,7 @@ go test -cover ./...
 # Run specific package tests
 go test ./internal/db -v
 go test ./internal/git -v
+go test ./internal/tui -v
 
 # Tidy dependencies
 go mod tidy
@@ -112,6 +124,46 @@ The core workflow aggregates git commits into worklog entries:
 - `GetLatestCommitHash()` runs `git rev-parse HEAD`
 - All operations require absolute repo paths (`filepath.Abs()`)
 
+### TUI Architecture
+
+`internal/tui/` implements a terminal user interface using tview:
+
+**Main Components:**
+- `app.go` - Application shell with page management and navigation
+- `projects.go` - Projects list view (table with CRUD operations)
+- `entries.go` - Entries list view with filtering and summary footer
+- `stats.go` - Statistics dashboard with breakdowns
+- `project_form.go` - Project create/edit modal forms
+- `entry_form.go` - Entry create/edit with git/manual modes
+- `modals.go` - Reusable error/confirm/info dialogs
+- `theme.go` - Color scheme constants
+- `helpers.go` - Formatting utilities (duration, dates, percentages)
+
+**Navigation Flow:**
+```
+Projects View (default)
+  → Entries View (filtered by project)
+    → Statistics View (with filters)
+    → Entry Forms (git/manual modes)
+  → Project Forms (create/edit)
+```
+
+**Keyboard Shortcuts:**
+- Global: `Ctrl+C`/`Ctrl+Q` = quit, `Esc` = close modal
+- Projects: `n` = new, `e` = edit, `d` = delete, `Enter` = view entries, `q` = quit
+- Entries: `n` = new, `e` = edit, `d` = delete, `i` = toggle invoiced, `f` = filter, `s` = stats, `q` = back
+- Stats: `f` = filter, `r` = refresh, `q` = back
+
+**Filtering:**
+- `FilterOptions` struct tracks current filters (project, date range, invoiced status)
+- Filters persist within a session, reset between entries/stats views
+- Uses `store.ListEntriesFiltered()` and `store.GetStatistics()` with filter parameters
+
+**TUI vs MCP Mode:**
+- Both use same `db.Store` interface - no database layer changes needed
+- Entry point (`main.go`) checks for `tui` argument to determine mode
+- Only one mode can run at a time due to bbolt's single-writer file lock
+
 ## Key Implementation Details
 
 ### MCP Server Initialization
@@ -138,9 +190,16 @@ Entry point (`cmd/clockwork/main.go`) → `server.New()`:
 
 ## Dependencies
 
+**Core:**
 - **github.com/mark3labs/mcp-go v0.9.0** - MCP protocol (stdio transport)
 - **go.etcd.io/bbolt v1.3.11** - Embedded key-value database
 - **github.com/google/uuid v1.6.0** - UUID generation
+
+**TUI:**
+- **github.com/rivo/tview v0.42.0** - Terminal UI framework (high-level widgets)
+- **github.com/gdamore/tcell/v2 v2.8.1** - Terminal cell-based view (tview dependency)
+
+**System:**
 - System **git** command required (not a Go dependency)
 
 ## Database Location
@@ -148,4 +207,30 @@ Entry point (`cmd/clockwork/main.go`) → `server.New()`:
 Production: `~/.local/clockwork/default.db`
 Tests: `t.TempDir()/<testname>.db`
 
-Only one instance can hold the database lock at a time (bbolt limitation).
+**Important Limitation:** Only one instance can hold the database lock at a time (bbolt limitation). This means:
+- Cannot run MCP server and TUI simultaneously
+- Attempting to start TUI while MCP server is running will fail with "timeout" error
+- Attempting to start MCP server while TUI is running will fail with "timeout" error
+- This is by design for data integrity - bbolt ensures single-writer safety
+
+## TUI Usage
+
+After building, launch the TUI:
+
+```bash
+./clockwork tui
+```
+
+**Quick Start:**
+1. Press `n` in Projects view to create first project
+2. Enter project name and git repository path
+3. Press `Enter` on project to view entries
+4. Press `n` to create entry (choose Git or Manual mode)
+5. Git mode: automatically aggregates commits since last entry
+6. Manual mode: enter duration (e.g., "1h 30m") and message
+7. Press `s` from entries view to see statistics
+8. Press `f` to apply filters (project, date range, invoiced status)
+
+**Entry Creation Modes:**
+- **Git Mode**: Fetches commits since last entry, auto-calculates duration, generates message from commit summaries
+- **Manual Mode**: User enters duration and message manually (for non-git work like meetings)
