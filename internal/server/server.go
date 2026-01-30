@@ -36,7 +36,16 @@ func New() (*ClockworkServer, error) {
 	}
 
 	// Create MCP server
-	mcpServer := server.NewMCPServer("clockwork", "1.0.0")
+	mcpServer := server.NewMCPServer(
+		"clockwork",
+		"1.0.0",
+		server.WithInstructions(`Automatically track work time based on git commits of a project.
+
+Examples:
+- "track 2h" - Create entry with 2 hours from recent git commits
+- "clockwork 1h" - Create entry with 1 hour from recent commits
+- "book 1h meeting with alex" - Manual entry without git commit aggregation`),
+	)
 
 	cs := &ClockworkServer{
 		store: store,
@@ -56,7 +65,11 @@ func (s *ClockworkServer) Close() error {
 
 // Helper function to get required string argument
 func getRequiredString(request mcp.CallToolRequest, key string) (string, error) {
-	val, ok := request.Params.Arguments[key]
+	args, ok := request.Params.Arguments.(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("invalid arguments type")
+	}
+	val, ok := args[key]
 	if !ok {
 		return "", fmt.Errorf("missing required argument: %s", key)
 	}
@@ -127,7 +140,7 @@ func (s *ClockworkServer) registerUpdateProject() {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		args := request.Params.Arguments
+		args, _ := request.Params.Arguments.(map[string]interface{})
 
 		name, _ := args["name"].(string)
 		gitRepoPath, _ := args["git_repo_path"].(string)
@@ -194,7 +207,7 @@ func (s *ClockworkServer) registerCreateEntry() {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		args := request.Params.Arguments
+		args, _ := request.Params.Arguments.(map[string]interface{})
 
 		customMessage, _ := args["message"].(string)
 		invoiced, _ := args["invoiced"].(bool)
@@ -234,7 +247,15 @@ func (s *ClockworkServer) registerCreateEntry() {
 				message = "Manual entry"
 			}
 
-			entry, err := s.store.CreateEntry(projectID, duration, message, "", invoiced, createdAt)
+			// For manual entries, always store current HEAD commit hash (even if duplicate)
+			project, _ := s.store.GetProject(projectID)
+			currentHash, err := git.GetLatestCommitHash(project.GitRepoPath)
+			if err != nil {
+				// If we can't get HEAD hash, just store empty string
+				currentHash = ""
+			}
+
+			entry, err := s.store.CreateEntry(projectID, duration, message, currentHash, invoiced, createdAt)
 			if err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
@@ -257,7 +278,13 @@ func (s *ClockworkServer) registerCreateEntry() {
 
 		var sinceHash string
 		if lastEntry != nil && lastEntry.CommitHash != "" {
-			sinceHash = lastEntry.CommitHash
+			// Validate that the commit hash exists in the repository
+			if git.ValidateCommitHash(project.GitRepoPath, lastEntry.CommitHash) {
+				sinceHash = lastEntry.CommitHash
+			} else {
+				// Invalid or not found - fall back to getting all commits from HEAD
+				sinceHash = ""
+			}
 		}
 
 		// Get commits since last entry
@@ -325,7 +352,7 @@ func (s *ClockworkServer) registerUpdateEntry() {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		args := request.Params.Arguments
+		args, _ := request.Params.Arguments.(map[string]interface{})
 
 		var duration *int64
 		var message, commitHash *string
@@ -401,7 +428,7 @@ func (s *ClockworkServer) registerListEntries() {
 	)
 
 	s.mcp.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		args := request.Params.Arguments
+		args, _ := request.Params.Arguments.(map[string]interface{})
 
 		projectID, _ := args["project_id"].(string)
 		invoicedStr, _ := args["invoiced"].(string)
@@ -435,7 +462,7 @@ func (s *ClockworkServer) registerGetStatistics() {
 	)
 
 	s.mcp.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		args := request.Params.Arguments
+		args, _ := request.Params.Arguments.(map[string]interface{})
 
 		projectID, _ := args["project_id"].(string)
 		startDateStr, _ := args["start_date"].(string)

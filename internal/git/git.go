@@ -84,7 +84,30 @@ func GetLatestCommitHash(repoPath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to get latest commit: %w", err)
 	}
-	return strings.TrimSpace(string(output)), nil
+	hash := strings.TrimSpace(string(output))
+
+	// Validate hash format (40 hex characters)
+	if len(hash) != 40 {
+		return "", fmt.Errorf("invalid commit hash length: got %d, expected 40", len(hash))
+	}
+	for _, c := range hash {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return "", fmt.Errorf("invalid commit hash: contains non-hex character '%c'", c)
+		}
+	}
+
+	return hash, nil
+}
+
+// ValidateCommitHash checks if a commit hash exists in the repository
+func ValidateCommitHash(repoPath, hash string) bool {
+	if hash == "" {
+		return false
+	}
+
+	cmd := exec.Command("git", "cat-file", "-e", hash)
+	cmd.Dir = repoPath
+	return cmd.Run() == nil
 }
 
 // AggregateCommits aggregates multiple commits into a summary message
