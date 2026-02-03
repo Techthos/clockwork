@@ -61,6 +61,16 @@ func (a *App) createEntriesView(projectID string) tview.Primitive {
 
 	// Load and display entries
 	loadEntries := func() {
+		// Remember currently selected entry ID before clearing
+		var selectedEntryID string
+		row, _ := table.GetSelection()
+		if row > 0 {
+			cell := table.GetCell(row, 0)
+			if entry, ok := cell.Reference.(*models.Entry); ok {
+				selectedEntryID = entry.ID
+			}
+		}
+
 		table.Clear()
 
 		entries, err := a.store.ListEntriesFiltered(
@@ -102,6 +112,9 @@ func (a *App) createEntriesView(projectID string) tview.Primitive {
 		var invoicedMinutes int64
 		var uninvoicedMinutes int64
 
+		// Track which row contains the previously selected entry
+		rowToSelect := 1
+
 		// Add entry rows
 		for i, entry := range entries {
 			row := i + 1
@@ -112,6 +125,11 @@ func (a *App) createEntriesView(projectID string) tview.Primitive {
 				invoicedMinutes += entry.Duration
 			} else {
 				uninvoicedMinutes += entry.Duration
+			}
+
+			// Check if this is the previously selected entry
+			if selectedEntryID != "" && entry.ID == selectedEntryID {
+				rowToSelect = row
 			}
 
 			// Format invoiced status
@@ -150,9 +168,9 @@ func (a *App) createEntriesView(projectID string) tview.Primitive {
 				SetAlign(tview.AlignCenter))
 		}
 
-		// Select first data row
+		// Select appropriate row (previously selected entry or first row)
 		if len(entries) > 0 {
-			table.Select(1, 0)
+			table.Select(rowToSelect, 0)
 		}
 	}
 
