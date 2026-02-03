@@ -201,6 +201,21 @@ func (s *Store) CreateEntry(projectID string, duration int64, message, commitHas
 		return nil, fmt.Errorf("project not found: %w", err)
 	}
 
+	// Validate commit hash for corruption patterns
+	if commitHash != "" && len(commitHash) >= 40 {
+		// Check for suspicious patterns in full-length hashes
+		// This specifically catches the e8e8e8e8 corruption bug
+		firstHalf := commitHash[:20]
+		secondHalf := commitHash[20:40]
+		if firstHalf == secondHalf {
+			return nil, fmt.Errorf("invalid commit hash: repeated pattern detected - possible corruption (hash: %s)", commitHash)
+		}
+		// Check for the specific e8 repetition pattern
+		if len(commitHash) == 40 && commitHash[20:] == "e8e8e8e8e8e8e8e8e8e8" {
+			return nil, fmt.Errorf("invalid commit hash: e8e8 corruption pattern detected (hash: %s)", commitHash)
+		}
+	}
+
 	entry := &models.Entry{
 		ID:         uuid.New().String(),
 		ProjectID:  projectID,
@@ -270,7 +285,21 @@ func (s *Store) UpdateEntry(id string, duration *int64, message, commitHash *str
 			entry.Message = *message
 		}
 		if commitHash != nil {
-			entry.CommitHash = *commitHash
+			// Validate commit hash for corruption patterns
+			newHash := *commitHash
+			if newHash != "" && len(newHash) >= 40 {
+				// Check for suspicious patterns in full-length hashes
+				firstHalf := newHash[:20]
+				secondHalf := newHash[20:40]
+				if firstHalf == secondHalf {
+					return fmt.Errorf("invalid commit hash: repeated pattern detected - possible corruption (hash: %s)", newHash)
+				}
+				// Check for the specific e8 repetition pattern
+				if len(newHash) == 40 && newHash[20:] == "e8e8e8e8e8e8e8e8e8e8" {
+					return fmt.Errorf("invalid commit hash: e8e8 corruption pattern detected (hash: %s)", newHash)
+				}
+			}
+			entry.CommitHash = newHash
 		}
 		if invoiced != nil {
 			entry.Invoiced = *invoiced
