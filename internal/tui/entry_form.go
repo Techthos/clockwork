@@ -242,11 +242,13 @@ func (a *App) showManualEntryForm(entry *models.Entry, onComplete func()) {
 	var selectedProject *models.Project = projects[selectedIndex]
 	durationField := ""
 	messageField := ""
+	commitHashField := ""
 	invoiced := false
 
 	if isEdit {
 		durationField = FormatDuration(entry.Duration)
 		messageField = entry.Message
+		commitHashField = entry.CommitHash
 		invoiced = entry.Invoiced
 	}
 
@@ -268,6 +270,15 @@ func (a *App) showManualEntryForm(entry *models.Entry, onComplete func()) {
 	form.AddTextArea("Message", messageField, 60, 5, 0, func(text string) {
 		messageField = text
 	})
+
+	// Commit Hash field (optional)
+	form.AddInputField("Commit Hash (optional)", commitHashField, 50,
+		func(textToCheck string, lastChar rune) bool {
+			return true
+		},
+		func(text string) {
+			commitHashField = text
+		})
 
 	// Invoiced checkbox
 	form.AddCheckbox("Invoiced", invoiced, func(checked bool) {
@@ -300,7 +311,7 @@ func (a *App) showManualEntryForm(entry *models.Entry, onComplete func()) {
 
 		if isEdit {
 			// Update existing entry
-			_, err = a.store.UpdateEntry(entry.ID, &duration, &messageField, nil, &invoiced, nil)
+			_, err = a.store.UpdateEntry(entry.ID, &duration, &messageField, &commitHashField, &invoiced, nil)
 			if err != nil {
 				a.ShowErrorModal(fmt.Sprintf("Failed to update entry: %v", err), nil)
 				return
@@ -311,7 +322,7 @@ func (a *App) showManualEntryForm(entry *models.Entry, onComplete func()) {
 				selectedProject.ID,
 				duration,
 				messageField,
-				"",
+				commitHashField,
 				invoiced,
 				time.Now(),
 			)
