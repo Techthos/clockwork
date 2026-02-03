@@ -10,6 +10,7 @@ import (
 
 	"github.com/techthos/clockwork/internal/db"
 	"github.com/techthos/clockwork/internal/git"
+	"github.com/techthos/clockwork/internal/models"
 	"github.com/techthos/clockwork/internal/utils"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -270,27 +271,30 @@ func (s *ClockworkServer) registerCreateEntry() {
 		// Git-based entry path
 		project, _ := s.store.GetProject(projectID)
 
-		// Get last entry to determine since commit
-		lastEntry, err := s.store.GetLastEntry(projectID)
+		// Find the most recent commit hash across all entries (skips manual entries without one)
+		sinceHash, err := s.store.GetLastCommitHash(projectID)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		var sinceHash string
-		if lastEntry != nil && lastEntry.CommitHash != "" {
-			// Validate that the commit hash exists in the repository
-			if git.ValidateCommitHash(project.GitRepoPath, lastEntry.CommitHash) {
-				sinceHash = lastEntry.CommitHash
-			} else {
-				// Invalid or not found - fall back to getting all commits from HEAD
-				sinceHash = ""
-			}
+		// Validate that the commit hash still exists in the repository
+		if sinceHash != "" && !git.ValidateCommitHash(project.GitRepoPath, sinceHash) {
+			sinceHash = ""
 		}
 
-		// Get commits since last entry
-		commits, err := git.GetCommitsSince(project.GitRepoPath, sinceHash)
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("failed to get commits: %v", err)), nil
+		var commits []models.CommitInfo
+		if sinceHash != "" {
+			commits, err = git.GetCommitsSince(project.GitRepoPath, sinceHash)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("failed to get commits: %v", err)), nil
+			}
+		} else {
+			// No baseline — just grab HEAD as a single commit
+			commit, err := git.GetLatestCommit(project.GitRepoPath)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("failed to get latest commit: %v", err)), nil
+			}
+			commits = []models.CommitInfo{*commit}
 		}
 
 		if len(commits) == 0 {

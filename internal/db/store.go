@@ -379,6 +379,31 @@ func (s *Store) GetLastEntry(projectID string) (*models.Entry, error) {
 	return latest, nil
 }
 
+// GetLastCommitHash returns the most recent non-empty commit hash across all entries for a project.
+// Returns "" if no entry has a commit hash.
+func (s *Store) GetLastCommitHash(projectID string) (string, error) {
+	entries, err := s.ListEntries(projectID)
+	if err != nil {
+		return "", err
+	}
+
+	var latest *models.Entry
+	for _, entry := range entries {
+		if entry.CommitHash == "" {
+			continue
+		}
+		if latest == nil || entry.CreatedAt.After(latest.CreatedAt) {
+			latest = entry
+		}
+	}
+
+	if latest == nil {
+		return "", nil
+	}
+
+	return latest.CommitHash, nil
+}
+
 // ListEntriesFiltered returns entries with optional filtering
 func (s *Store) ListEntriesFiltered(projectID string, startDate, endDate *time.Time, invoicedFilter *bool) ([]*models.Entry, error) {
 	var entries []*models.Entry

@@ -99,6 +99,43 @@ func GetLatestCommitHash(repoPath string) (string, error) {
 	return hash, nil
 }
 
+// GetLatestCommit retrieves the single most recent commit from the repository
+func GetLatestCommit(repoPath string) (*models.CommitInfo, error) {
+	absPath, err := filepath.Abs(repoPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve repo path: %w", err)
+	}
+
+	cmd := exec.Command("git", "log", "-1", "--pretty=format:%H|%an|%s|%at")
+	cmd.Dir = absPath
+
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get latest commit: %w", err)
+	}
+
+	if len(output) == 0 {
+		return nil, fmt.Errorf("no commits found")
+	}
+
+	parts := strings.Split(strings.TrimSpace(string(output)), "|")
+	if len(parts) != 4 {
+		return nil, fmt.Errorf("unexpected git log output format")
+	}
+
+	timestamp, err := parseUnixTimestamp(parts[3])
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse commit timestamp: %w", err)
+	}
+
+	return &models.CommitInfo{
+		Hash:      parts[0],
+		Author:    parts[1],
+		Message:   parts[2],
+		Timestamp: timestamp,
+	}, nil
+}
+
 // ValidateCommitHash checks if a commit hash exists in the repository
 func ValidateCommitHash(repoPath, hash string) bool {
 	if hash == "" {

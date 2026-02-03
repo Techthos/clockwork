@@ -111,23 +111,28 @@ func (a *App) showGitEntryForm(defaultProjectID string, onComplete func()) {
 			return
 		}
 
-		// Get last entry for this project
-		lastEntry, err := a.store.GetLastEntry(selectedProject.ID)
+		// Find the most recent commit hash across all entries (skips manual entries without one)
+		sinceHash, err := a.store.GetLastCommitHash(selectedProject.ID)
 		if err != nil {
-			a.ShowErrorModal(fmt.Sprintf("Failed to get last entry: %v", err), nil)
+			a.ShowErrorModal(fmt.Sprintf("Failed to get last commit hash: %v", err), nil)
 			return
 		}
 
-		lastHash := ""
-		if lastEntry != nil {
-			lastHash = lastEntry.CommitHash
-		}
-
-		// Fetch commits since last entry
-		commits, err := git.GetCommitsSince(selectedProject.GitRepoPath, lastHash)
-		if err != nil {
-			a.ShowErrorModal(fmt.Sprintf("Failed to fetch commits: %v", err), nil)
-			return
+		var commits []models.CommitInfo
+		if sinceHash != "" {
+			commits, err = git.GetCommitsSince(selectedProject.GitRepoPath, sinceHash)
+			if err != nil {
+				a.ShowErrorModal(fmt.Sprintf("Failed to fetch commits: %v", err), nil)
+				return
+			}
+		} else {
+			// No baseline — just grab HEAD as a single commit
+			commit, err := git.GetLatestCommit(selectedProject.GitRepoPath)
+			if err != nil {
+				a.ShowErrorModal(fmt.Sprintf("Failed to get latest commit: %v", err), nil)
+				return
+			}
+			commits = []models.CommitInfo{*commit}
 		}
 
 		if len(commits) == 0 {
