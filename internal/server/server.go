@@ -5,15 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
 
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 	"github.com/techthos/clockwork/internal/db"
 	"github.com/techthos/clockwork/internal/git"
 	"github.com/techthos/clockwork/internal/models"
 	"github.com/techthos/clockwork/internal/utils"
-	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
 )
 
 // ClockworkServer represents the MCP server for time tracking
@@ -24,13 +23,11 @@ type ClockworkServer struct {
 
 // New creates a new Clockwork MCP server
 func New() (*ClockworkServer, error) {
-	// Initialize database
-	homeDir, err := os.UserHomeDir()
+	dbPath, err := db.DefaultPath()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get home directory: %w", err)
+		return nil, fmt.Errorf("failed to resolve database path: %w", err)
 	}
 
-	dbPath := filepath.Join(homeDir, ".local", "clockwork", "default.db")
 	store, err := db.New(dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize database: %w", err)
@@ -78,7 +75,29 @@ func getRequiredString(request mcp.CallToolRequest, key string) (string, error) 
 	if !ok {
 		return "", fmt.Errorf("argument %s must be a string", key)
 	}
+	if str == "" {
+		return "", fmt.Errorf("argument %s must not be empty", key)
+	}
 	return str, nil
+}
+
+// argsMap returns the request arguments as a map (empty map if missing/wrong type).
+func argsMap(request mcp.CallToolRequest) map[string]interface{} {
+	if m, ok := request.Params.Arguments.(map[string]interface{}); ok {
+		return m
+	}
+	return map[string]interface{}{}
+}
+
+// jsonResult marshals v to indented JSON and wraps it in an MCP tool result.
+// If marshaling fails, an error result is returned instead of silently
+// emitting invalid JSON.
+func jsonResult(v interface{}) *mcp.CallToolResult {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to marshal response: %v", err))
+	}
+	return mcp.NewToolResultText(string(data))
 }
 
 // Serve starts the MCP server using stdio transport
@@ -118,13 +137,19 @@ func (s *ClockworkServer) registerCreateProject() {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
+		// Validate that the git repo path exists on disk and is a directory.
+		if info, err := os.Stat(gitRepoPath); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("git_repo_path not accessible: %v", err)), nil
+		} else if !info.IsDir() {
+			return mcp.NewToolResultError("git_repo_path must be a directory"), nil
+		}
+
 		project, err := s.store.CreateProject(name, gitRepoPath)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		result, _ := json.MarshalIndent(project, "", "  ")
-		return mcp.NewToolResultText(string(result)), nil
+		return jsonResult(project), nil
 	})
 }
 
@@ -141,18 +166,28 @@ func (s *ClockworkServer) registerUpdateProject() {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		args, _ := request.Params.Arguments.(map[string]interface{})
+		args := argsMap(request)
 
 		name, _ := args["name"].(string)
 		gitRepoPath, _ := args["git_repo_path"].(string)
+
+		if name == "" && gitRepoPath == "" {
+			return mcp.NewToolResultError("at least one of 'name' or 'git_repo_path' must be provided"), nil
+		}
+		if gitRepoPath != "" {
+			if info, err := os.Stat(gitRepoPath); err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("git_repo_path not accessible: %v", err)), nil
+			} else if !info.IsDir() {
+				return mcp.NewToolResultError("git_repo_path must be a directory"), nil
+			}
+		}
 
 		project, err := s.store.UpdateProject(id, name, gitRepoPath)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		result, _ := json.MarshalIndent(project, "", "  ")
-		return mcp.NewToolResultText(string(result)), nil
+		return jsonResult(project), nil
 	})
 }
 
@@ -187,8 +222,7 @@ func (s *ClockworkServer) registerListProjects() {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		result, _ := json.MarshalIndent(projects, "", "  ")
-		return mcp.NewToolResultText(string(result)), nil
+		return jsonResult(projects), nil
 	})
 }
 
@@ -208,7 +242,7 @@ func (s *ClockworkServer) registerCreateEntry() {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		args, _ := request.Params.Arguments.(map[string]interface{})
+		args := argsMap(request)
 
 		customMessage, _ := args["message"].(string)
 		invoiced, _ := args["invoiced"].(bool)
@@ -226,8 +260,8 @@ func (s *ClockworkServer) registerCreateEntry() {
 			createdAt = parsed
 		}
 
-		// Validate project exists
-		_, err = s.store.GetProject(projectID)
+		// Resolve project once (single source of truth for the rest of the handler).
+		project, err := s.store.GetProject(projectID)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("project not found: %v", err)), nil
 		}
@@ -248,11 +282,10 @@ func (s *ClockworkServer) registerCreateEntry() {
 				message = "Manual entry"
 			}
 
-			// For manual entries, always store current HEAD commit hash (even if duplicate)
-			project, _ := s.store.GetProject(projectID)
-			currentHash, err := git.GetLatestCommitHash(project.GitRepoPath)
-			if err != nil {
-				// If we can't get HEAD hash, just store empty string
+			// Best-effort attempt to record current HEAD; degrade gracefully but log warning.
+			currentHash, hashErr := git.GetLatestCommitHash(project.GitRepoPath)
+			if hashErr != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not read git HEAD for manual entry (project %s): %v\n", projectID, hashErr)
 				currentHash = ""
 			}
 
@@ -261,15 +294,13 @@ func (s *ClockworkServer) registerCreateEntry() {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 
-			result, _ := json.MarshalIndent(map[string]interface{}{
+			return jsonResult(map[string]interface{}{
 				"entry": entry,
 				"mode":  "manual",
-			}, "", "  ")
-			return mcp.NewToolResultText(string(result)), nil
+			}), nil
 		}
 
 		// Git-based entry path
-		project, _ := s.store.GetProject(projectID)
 
 		// Find the most recent commit hash across all entries (skips manual entries without one)
 		sinceHash, err := s.store.GetLastCommitHash(projectID)
@@ -330,12 +361,11 @@ func (s *ClockworkServer) registerCreateEntry() {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		result, _ := json.MarshalIndent(map[string]interface{}{
+		return jsonResult(map[string]interface{}{
 			"entry":         entry,
 			"commits_found": len(commits),
 			"mode":          "git",
-		}, "", "  ")
-		return mcp.NewToolResultText(string(result)), nil
+		}), nil
 	})
 }
 
@@ -356,7 +386,7 @@ func (s *ClockworkServer) registerUpdateEntry() {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		args, _ := request.Params.Arguments.(map[string]interface{})
+		args := argsMap(request)
 
 		var duration *int64
 		var message, commitHash *string
@@ -394,13 +424,16 @@ func (s *ClockworkServer) registerUpdateEntry() {
 			createdAt = &parsed
 		}
 
+		if duration == nil && message == nil && commitHash == nil && invoiced == nil && createdAt == nil {
+			return mcp.NewToolResultError("no fields provided to update"), nil
+		}
+
 		entry, err := s.store.UpdateEntry(id, duration, message, commitHash, invoiced, createdAt)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		result, _ := json.MarshalIndent(entry, "", "  ")
-		return mcp.NewToolResultText(string(result)), nil
+		return jsonResult(entry), nil
 	})
 }
 
@@ -434,7 +467,7 @@ func (s *ClockworkServer) registerListEntries() {
 	)
 
 	s.mcp.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		args, _ := request.Params.Arguments.(map[string]interface{})
+		args := argsMap(request)
 
 		projectID, _ := args["project_id"].(string)
 		startDateStr, _ := args["start_date"].(string)
@@ -481,8 +514,7 @@ func (s *ClockworkServer) registerListEntries() {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		result, _ := json.MarshalIndent(entries, "", "  ")
-		return mcp.NewToolResultText(string(result)), nil
+		return jsonResult(entries), nil
 	})
 }
 
@@ -496,7 +528,7 @@ func (s *ClockworkServer) registerGetStatistics() {
 	)
 
 	s.mcp.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		args, _ := request.Params.Arguments.(map[string]interface{})
+		args := argsMap(request)
 
 		projectID, _ := args["project_id"].(string)
 		startDateStr, _ := args["start_date"].(string)
@@ -544,7 +576,6 @@ func (s *ClockworkServer) registerGetStatistics() {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		result, _ := json.MarshalIndent(stats, "", "  ")
-		return mcp.NewToolResultText(string(result)), nil
+		return jsonResult(stats), nil
 	})
 }

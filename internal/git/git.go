@@ -1,6 +1,7 @@
 package git
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"path/filepath"
@@ -10,15 +11,21 @@ import (
 	"github.com/techthos/clockwork/internal/models"
 )
 
-// GetAuthor retrieves the git author name from git config
-func GetAuthor(repoPath string) (string, error) {
-	cmd := exec.Command("git", "config", "user.name")
+// gitTimeout caps how long any git subprocess may run.
+const gitTimeout = 10 * time.Second
+
+// runGit executes git with the given args inside repoPath under a timeout.
+func runGit(repoPath string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = repoPath
-	output, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("failed to get git author: %w", err)
+	out, err := cmd.Output()
+	if ctx.Err() == context.DeadlineExceeded {
+		return nil, fmt.Errorf("git %s timed out after %s", args[0], gitTimeout)
 	}
-	return strings.TrimSpace(string(output)), nil
+	return out, err
 }
 
 // GetCommitsSince retrieves commits from the repository since a specific commit hash
@@ -29,7 +36,6 @@ func GetCommitsSince(repoPath, sinceHash string) ([]models.CommitInfo, error) {
 		return nil, fmt.Errorf("failed to resolve repo path: %w", err)
 	}
 
-	// Build git log command
 	args := []string{
 		"log",
 		"--pretty=format:%H|%an|%s|%at",
@@ -39,10 +45,7 @@ func GetCommitsSince(repoPath, sinceHash string) ([]models.CommitInfo, error) {
 		args = append(args, fmt.Sprintf("%s..HEAD", sinceHash))
 	}
 
-	cmd := exec.Command("git", args...)
-	cmd.Dir = absPath
-
-	output, err := cmd.Output()
+	output, err := runGit(absPath, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get git commits: %w", err)
 	}
@@ -78,9 +81,7 @@ func GetCommitsSince(repoPath, sinceHash string) ([]models.CommitInfo, error) {
 
 // GetLatestCommitHash retrieves the latest commit hash from the repository
 func GetLatestCommitHash(repoPath string) (string, error) {
-	cmd := exec.Command("git", "rev-parse", "HEAD")
-	cmd.Dir = repoPath
-	output, err := cmd.Output()
+	output, err := runGit(repoPath, "rev-parse", "HEAD")
 	if err != nil {
 		return "", fmt.Errorf("failed to get latest commit: %w", err)
 	}
@@ -106,10 +107,7 @@ func GetLatestCommit(repoPath string) (*models.CommitInfo, error) {
 		return nil, fmt.Errorf("failed to resolve repo path: %w", err)
 	}
 
-	cmd := exec.Command("git", "log", "-1", "--pretty=format:%H|%an|%s|%at")
-	cmd.Dir = absPath
-
-	output, err := cmd.Output()
+	output, err := runGit(absPath, "log", "-1", "--pretty=format:%H|%an|%s|%at")
 	if err != nil {
 		return nil, fmt.Errorf("failed to get latest commit: %w", err)
 	}
@@ -142,10 +140,19 @@ func ValidateCommitHash(repoPath, hash string) bool {
 		return false
 	}
 
-	cmd := exec.Command("git", "cat-file", "-e", hash)
+	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "git", "cat-file", "-e", hash)
 	cmd.Dir = repoPath
 	return cmd.Run() == nil
 }
+
+// Heuristic constants for CalculateDuration.
+const (
+	singleCommitMinutes = 30 // assumed work for a single isolated commit
+	bufferMinutes       = 30 // buffer added on top of commit-span time
+)
 
 // AggregateCommits aggregates multiple commits into a summary message
 func AggregateCommits(commits []models.CommitInfo) string {
@@ -157,9 +164,13 @@ func AggregateCommits(commits []models.CommitInfo) string {
 	builder.WriteString(fmt.Sprintf("Aggregated %d commits:\n", len(commits)))
 
 	for i, commit := range commits {
+		hashShort := commit.Hash
+		if len(hashShort) > 7 {
+			hashShort = hashShort[:7]
+		}
 		builder.WriteString(fmt.Sprintf("%d. [%s] %s\n",
 			i+1,
-			commit.Hash[:7],
+			hashShort,
 			commit.Message))
 	}
 
@@ -167,14 +178,14 @@ func AggregateCommits(commits []models.CommitInfo) string {
 }
 
 // CalculateDuration estimates work duration based on commit timestamps
-// Uses a simple heuristic: time between first and last commit + 30 minutes
+// Uses a simple heuristic: time between first and last commit + buffer
 func CalculateDuration(commits []models.CommitInfo) int64 {
 	if len(commits) == 0 {
 		return 0
 	}
 
 	if len(commits) == 1 {
-		return 30 // Default 30 minutes for single commit
+		return singleCommitMinutes
 	}
 
 	// Find earliest and latest commits
@@ -191,9 +202,7 @@ func CalculateDuration(commits []models.CommitInfo) int64 {
 	}
 
 	duration := latest.Sub(earliest)
-	minutes := int64(duration.Minutes()) + 30 // Add buffer time
-
-	return minutes
+	return int64(duration.Minutes()) + bufferMinutes
 }
 
 func parseUnixTimestamp(ts string) (time.Time, error) {

@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/techthos/clockwork/internal/db"
 	"github.com/techthos/clockwork/internal/server"
@@ -23,7 +22,7 @@ func main() {
 
 func runTUI() {
 	// Initialize database
-	dbPath, err := getDBPath()
+	dbPath, err := db.DefaultPath()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to resolve database path: %v\n", err)
 		os.Exit(1)
@@ -58,10 +57,3 @@ func runMCPServer() {
 	}
 }
 
-func getDBPath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".local", "clockwork", "default.db"), nil
-}

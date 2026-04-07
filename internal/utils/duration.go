@@ -7,6 +7,12 @@ import (
 	"strings"
 )
 
+// Pre-compiled regexes (compiled once at package init for performance).
+var (
+	hoursRegex   = regexp.MustCompile(`(-?\d+\.?\d*)h`)
+	minutesRegex = regexp.MustCompile(`(-?\d+)m`)
+)
+
 // ParseDuration converts duration strings to minutes
 // Supported formats:
 //   - "1h 30m" -> 90
@@ -33,7 +39,6 @@ func ParseDuration(input string) (int64, error) {
 	var totalMinutes float64
 
 	// Extract hours (supports decimal: 1.5h, also catches negative values)
-	hoursRegex := regexp.MustCompile(`(-?\d+\.?\d*)h`)
 	if matches := hoursRegex.FindStringSubmatch(input); len(matches) > 1 {
 		hours, err := strconv.ParseFloat(matches[1], 64)
 		if err != nil {
@@ -43,7 +48,6 @@ func ParseDuration(input string) (int64, error) {
 	}
 
 	// Extract minutes (also catches negative values)
-	minutesRegex := regexp.MustCompile(`(-?\d+)m`)
 	if matches := minutesRegex.FindStringSubmatch(input); len(matches) > 1 {
 		minutes, err := strconv.ParseFloat(matches[1], 64)
 		if err != nil {

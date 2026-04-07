@@ -22,6 +22,20 @@ type Store struct {
 	db *bolt.DB
 }
 
+// DefaultPath returns the canonical clockwork database path.
+// Honours the CLOCKWORK_DB env var, otherwise falls back to
+// ~/.local/clockwork/default.db.
+func DefaultPath() (string, error) {
+	if p := os.Getenv("CLOCKWORK_DB"); p != "" {
+		return p, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve home directory: %w", err)
+	}
+	return filepath.Join(home, ".local", "clockwork", "default.db"), nil
+}
+
 // New creates a new Store instance and initializes the database
 func New(dbPath string) (*Store, error) {
 	// Ensure directory exists
@@ -59,6 +73,33 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// bucket safely retrieves a bucket and returns an error if missing.
+func bucket(tx *bolt.Tx, name string) (*bolt.Bucket, error) {
+	b := tx.Bucket([]byte(name))
+	if b == nil {
+		return nil, fmt.Errorf("bucket %q not found (database not initialized?)", name)
+	}
+	return b, nil
+}
+
+// validateCommitHash rejects empty/short hashes only when we have something
+// long enough to validate; catches the e8e8 corruption pattern and obvious
+// repetition. Hashes shorter than 40 chars (e.g. test fixtures) are allowed.
+func validateCommitHash(hash string) error {
+	if hash == "" || len(hash) < 40 {
+		return nil
+	}
+	// Repetition check - first half identical to second half indicates corruption.
+	if hash[:20] == hash[20:40] {
+		return fmt.Errorf("invalid commit hash: repeated pattern detected - possible corruption (hash: %s)", hash)
+	}
+	// Specific e8e8 corruption pattern.
+	if len(hash) == 40 && hash[20:] == "e8e8e8e8e8e8e8e8e8e8" {
+		return fmt.Errorf("invalid commit hash: e8e8 corruption pattern detected (hash: %s)", hash)
+	}
+	return nil
+}
+
 // CreateProject creates a new project
 func (s *Store) CreateProject(name, gitRepoPath string) (*models.Project, error) {
 	project := &models.Project{
@@ -70,7 +111,10 @@ func (s *Store) CreateProject(name, gitRepoPath string) (*models.Project, error)
 	}
 
 	err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(projectsBucket))
+		b, err := bucket(tx, projectsBucket)
+		if err != nil {
+			return err
+		}
 		data, err := json.Marshal(project)
 		if err != nil {
 			return err
@@ -90,7 +134,10 @@ func (s *Store) GetProject(id string) (*models.Project, error) {
 	var project models.Project
 
 	err := s.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(projectsBucket))
+		b, err := bucket(tx, projectsBucket)
+		if err != nil {
+			return err
+		}
 		data := b.Get([]byte(id))
 		if data == nil {
 			return fmt.Errorf("project not found")
@@ -110,7 +157,10 @@ func (s *Store) UpdateProject(id, name, gitRepoPath string) (*models.Project, er
 	var project models.Project
 
 	err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(projectsBucket))
+		b, err := bucket(tx, projectsBucket)
+		if err != nil {
+			return err
+		}
 		data := b.Get([]byte(id))
 		if data == nil {
 			return fmt.Errorf("project not found")
@@ -143,30 +193,47 @@ func (s *Store) UpdateProject(id, name, gitRepoPath string) (*models.Project, er
 	return &project, nil
 }
 
-// DeleteProject deletes a project and all its entries
+// DeleteProject deletes a project and all its entries (single-pass cascade).
 func (s *Store) DeleteProject(id string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
-		// Delete project
-		pb := tx.Bucket([]byte(projectsBucket))
+		pb, err := bucket(tx, projectsBucket)
+		if err != nil {
+			return err
+		}
+		if pb.Get([]byte(id)) == nil {
+			return fmt.Errorf("project not found")
+		}
 		if err := pb.Delete([]byte(id)); err != nil {
 			return err
 		}
 
-		// Delete associated entries
-		eb := tx.Bucket([]byte(entriesBucket))
-		c := eb.Cursor()
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			var entry models.Entry
-			if err := json.Unmarshal(v, &entry); err != nil {
-				continue
-			}
-			if entry.ProjectID == id {
-				if err := eb.Delete(k); err != nil {
-					return err
-				}
-			}
+		eb, err := bucket(tx, entriesBucket)
+		if err != nil {
+			return err
 		}
 
+		// Collect matching keys first; deleting during cursor iteration is unsafe.
+		var toDelete [][]byte
+		if err := eb.ForEach(func(k, v []byte) error {
+			var entry models.Entry
+			if err := json.Unmarshal(v, &entry); err != nil {
+				return nil // skip corrupt rows
+			}
+			if entry.ProjectID == id {
+				kCopy := make([]byte, len(k))
+				copy(kCopy, k)
+				toDelete = append(toDelete, kCopy)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		for _, k := range toDelete {
+			if err := eb.Delete(k); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 }
@@ -176,7 +243,10 @@ func (s *Store) ListProjects() ([]*models.Project, error) {
 	var projects []*models.Project
 
 	err := s.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(projectsBucket))
+		b, err := bucket(tx, projectsBucket)
+		if err != nil {
+			return err
+		}
 		return b.ForEach(func(k, v []byte) error {
 			var project models.Project
 			if err := json.Unmarshal(v, &project); err != nil {
@@ -196,24 +266,8 @@ func (s *Store) ListProjects() ([]*models.Project, error) {
 
 // CreateEntry creates a new worklog entry
 func (s *Store) CreateEntry(projectID string, duration int64, message, commitHash string, invoiced bool, createdAt time.Time) (*models.Entry, error) {
-	// Verify project exists
-	if _, err := s.GetProject(projectID); err != nil {
-		return nil, fmt.Errorf("project not found: %w", err)
-	}
-
-	// Validate commit hash for corruption patterns
-	if commitHash != "" && len(commitHash) >= 40 {
-		// Check for suspicious patterns in full-length hashes
-		// This specifically catches the e8e8e8e8 corruption bug
-		firstHalf := commitHash[:20]
-		secondHalf := commitHash[20:40]
-		if firstHalf == secondHalf {
-			return nil, fmt.Errorf("invalid commit hash: repeated pattern detected - possible corruption (hash: %s)", commitHash)
-		}
-		// Check for the specific e8 repetition pattern
-		if len(commitHash) == 40 && commitHash[20:] == "e8e8e8e8e8e8e8e8e8e8" {
-			return nil, fmt.Errorf("invalid commit hash: e8e8 corruption pattern detected (hash: %s)", commitHash)
-		}
+	if err := validateCommitHash(commitHash); err != nil {
+		return nil, err
 	}
 
 	entry := &models.Entry{
@@ -228,12 +282,24 @@ func (s *Store) CreateEntry(projectID string, duration int64, message, commitHas
 	}
 
 	err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(entriesBucket))
+		// Verify project exists inside the same transaction.
+		pb, err := bucket(tx, projectsBucket)
+		if err != nil {
+			return err
+		}
+		if pb.Get([]byte(projectID)) == nil {
+			return fmt.Errorf("project not found: %s", projectID)
+		}
+
+		eb, err := bucket(tx, entriesBucket)
+		if err != nil {
+			return err
+		}
 		data, err := json.Marshal(entry)
 		if err != nil {
 			return err
 		}
-		return b.Put([]byte(entry.ID), data)
+		return eb.Put([]byte(entry.ID), data)
 	})
 
 	if err != nil {
@@ -248,7 +314,10 @@ func (s *Store) GetEntry(id string) (*models.Entry, error) {
 	var entry models.Entry
 
 	err := s.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(entriesBucket))
+		b, err := bucket(tx, entriesBucket)
+		if err != nil {
+			return err
+		}
 		data := b.Get([]byte(id))
 		if data == nil {
 			return fmt.Errorf("entry not found")
@@ -265,10 +334,19 @@ func (s *Store) GetEntry(id string) (*models.Entry, error) {
 
 // UpdateEntry updates an existing entry
 func (s *Store) UpdateEntry(id string, duration *int64, message, commitHash *string, invoiced *bool, createdAt *time.Time) (*models.Entry, error) {
+	if commitHash != nil {
+		if err := validateCommitHash(*commitHash); err != nil {
+			return nil, err
+		}
+	}
+
 	var entry models.Entry
 
 	err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(entriesBucket))
+		b, err := bucket(tx, entriesBucket)
+		if err != nil {
+			return err
+		}
 		data := b.Get([]byte(id))
 		if data == nil {
 			return fmt.Errorf("entry not found")
@@ -285,21 +363,7 @@ func (s *Store) UpdateEntry(id string, duration *int64, message, commitHash *str
 			entry.Message = *message
 		}
 		if commitHash != nil {
-			// Validate commit hash for corruption patterns
-			newHash := *commitHash
-			if newHash != "" && len(newHash) >= 40 {
-				// Check for suspicious patterns in full-length hashes
-				firstHalf := newHash[:20]
-				secondHalf := newHash[20:40]
-				if firstHalf == secondHalf {
-					return fmt.Errorf("invalid commit hash: repeated pattern detected - possible corruption (hash: %s)", newHash)
-				}
-				// Check for the specific e8 repetition pattern
-				if len(newHash) == 40 && newHash[20:] == "e8e8e8e8e8e8e8e8e8e8" {
-					return fmt.Errorf("invalid commit hash: e8e8 corruption pattern detected (hash: %s)", newHash)
-				}
-			}
-			entry.CommitHash = newHash
+			entry.CommitHash = *commitHash
 		}
 		if invoiced != nil {
 			entry.Invoiced = *invoiced
@@ -327,7 +391,10 @@ func (s *Store) UpdateEntry(id string, duration *int64, message, commitHash *str
 // DeleteEntry deletes an entry
 func (s *Store) DeleteEntry(id string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(entriesBucket))
+		b, err := bucket(tx, entriesBucket)
+		if err != nil {
+			return err
+		}
 		return b.Delete([]byte(id))
 	})
 }
@@ -337,7 +404,10 @@ func (s *Store) ListEntries(projectID string) ([]*models.Entry, error) {
 	var entries []*models.Entry
 
 	err := s.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(entriesBucket))
+		b, err := bucket(tx, entriesBucket)
+		if err != nil {
+			return err
+		}
 		return b.ForEach(func(k, v []byte) error {
 			var entry models.Entry
 			if err := json.Unmarshal(v, &entry); err != nil {
@@ -357,51 +427,70 @@ func (s *Store) ListEntries(projectID string) ([]*models.Entry, error) {
 	return entries, nil
 }
 
-// GetLastEntry returns the most recent entry for a project
+// GetLastEntry returns the most recent entry for a project in a single pass.
 func (s *Store) GetLastEntry(projectID string) (*models.Entry, error) {
-	entries, err := s.ListEntries(projectID)
+	var latest *models.Entry
+
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b, err := bucket(tx, entriesBucket)
+		if err != nil {
+			return err
+		}
+		return b.ForEach(func(k, v []byte) error {
+			var entry models.Entry
+			if err := json.Unmarshal(v, &entry); err != nil {
+				return err
+			}
+			if entry.ProjectID != projectID {
+				return nil
+			}
+			if latest == nil || entry.CreatedAt.After(latest.CreatedAt) {
+				e := entry
+				latest = &e
+			}
+			return nil
+		})
+	})
+
 	if err != nil {
 		return nil, err
-	}
-
-	if len(entries) == 0 {
-		return nil, nil
-	}
-
-	// Find most recent entry
-	var latest *models.Entry
-	for _, entry := range entries {
-		if latest == nil || entry.CreatedAt.After(latest.CreatedAt) {
-			latest = entry
-		}
 	}
 
 	return latest, nil
 }
 
-// GetLastCommitHash returns the most recent non-empty commit hash across all entries for a project.
-// Returns "" if no entry has a commit hash.
+// GetLastCommitHash returns the most recent non-empty commit hash across all entries
+// for a project in a single bucket pass.
 func (s *Store) GetLastCommitHash(projectID string) (string, error) {
-	entries, err := s.ListEntries(projectID)
+	var latestHash string
+	var latestTime time.Time
+
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b, err := bucket(tx, entriesBucket)
+		if err != nil {
+			return err
+		}
+		return b.ForEach(func(k, v []byte) error {
+			var entry models.Entry
+			if err := json.Unmarshal(v, &entry); err != nil {
+				return err
+			}
+			if entry.ProjectID != projectID || entry.CommitHash == "" {
+				return nil
+			}
+			if latestHash == "" || entry.CreatedAt.After(latestTime) {
+				latestHash = entry.CommitHash
+				latestTime = entry.CreatedAt
+			}
+			return nil
+		})
+	})
+
 	if err != nil {
 		return "", err
 	}
 
-	var latest *models.Entry
-	for _, entry := range entries {
-		if entry.CommitHash == "" {
-			continue
-		}
-		if latest == nil || entry.CreatedAt.After(latest.CreatedAt) {
-			latest = entry
-		}
-	}
-
-	if latest == nil {
-		return "", nil
-	}
-
-	return latest.CommitHash, nil
+	return latestHash, nil
 }
 
 // ListEntriesFiltered returns entries with optional filtering
@@ -409,9 +498,9 @@ func (s *Store) ListEntriesFiltered(projectID string, startDate, endDate *time.T
 	var entries []*models.Entry
 
 	err := s.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(entriesBucket))
-		if b == nil {
-			return nil
+		b, err := bucket(tx, entriesBucket)
+		if err != nil {
+			return err
 		}
 
 		return b.ForEach(func(k, v []byte) error {
@@ -469,9 +558,9 @@ func (s *Store) GetStatistics(projectID string, startDate, endDate *time.Time, i
 	}
 
 	err := s.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(entriesBucket))
-		if b == nil {
-			return nil
+		b, err := bucket(tx, entriesBucket)
+		if err != nil {
+			return err
 		}
 
 		return b.ForEach(func(k, v []byte) error {
