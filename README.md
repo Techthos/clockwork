@@ -556,3 +556,6 @@ Built with these excellent open-source projects:
 *Automate your time tracking. Focus on building great things.*
 
 </div>
+
+
+Built and maintained by [Techthos](https://www.techthos.net).
