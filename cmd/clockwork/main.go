@@ -10,14 +10,14 @@ import (
 )
 
 func main() {
-	// Check for TUI mode
-	if len(os.Args) > 1 && os.Args[1] == "tui" {
-		runTUI()
+	// Check for MCP server mode
+	if len(os.Args) > 1 && os.Args[1] == "mcp" {
+		runMCPServer()
 		return
 	}
 
-	// Default: Run MCP server
-	runMCPServer()
+	// Default: Run TUI
+	runTUI()
 }
 
 func runTUI() {

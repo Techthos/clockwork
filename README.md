@@ -86,8 +86,8 @@ go install ./cmd/clockwork
 
 ```bash
 # The binary supports two modes
-./clockwork          # Starts MCP server (default)
-./clockwork tui      # Starts terminal UI
+./clockwork          # Starts terminal UI (default)
+./clockwork mcp      # Starts MCP server
 ```
 
 ## ⚡ Quick Start
@@ -101,7 +101,8 @@ go install ./cmd/clockwork
 {
   "mcpServers": {
     "clockwork": {
-      "command": "/absolute/path/to/clockwork"
+      "command": "/absolute/path/to/clockwork",
+      "args": ["mcp"]
     }
   }
 }
@@ -112,7 +113,8 @@ go install ./cmd/clockwork
 {
   "mcpServers": {
     "clockwork": {
-      "command": "/absolute/path/to/clockwork"
+      "command": "/absolute/path/to/clockwork",
+      "args": ["mcp"]
     }
   }
 }
@@ -137,7 +139,7 @@ You: "Track the work I did today on the website project"
 #### 1. Launch the TUI
 
 ```bash
-./clockwork tui
+./clockwork
 ```
 
 #### 2. Create Your First Project

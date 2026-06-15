@@ -22,11 +22,11 @@ go build -o clockwork ./cmd/clockwork
 # Install to GOPATH/bin
 go install ./cmd/clockwork
 
-# Run MCP server mode (default)
+# Run TUI mode (default)
 ./clockwork
 
-# Run TUI mode
-./clockwork tui
+# Run MCP server mode
+./clockwork mcp
 
 # Run all tests
 go test ./...
@@ -55,7 +55,8 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) o
 {
   "mcpServers": {
     "clockwork": {
-      "command": "/absolute/path/to/clockwork"
+      "command": "/absolute/path/to/clockwork",
+      "args": ["mcp"]
     }
   }
 }
@@ -69,7 +70,8 @@ Edit `~/.claude/config.json`:
 {
   "mcpServers": {
     "clockwork": {
-      "command": "/absolute/path/to/clockwork"
+      "command": "/absolute/path/to/clockwork",
+      "args": ["mcp"]
     }
   }
 }
@@ -161,7 +163,7 @@ Projects View (default)
 
 **TUI vs MCP Mode:**
 - Both use same `db.Store` interface - no database layer changes needed
-- Entry point (`main.go`) checks for `tui` argument to determine mode
+- Entry point (`main.go`) runs the TUI by default and checks for the `mcp` argument to run the server
 - Only one mode can run at a time due to bbolt's single-writer file lock
 
 ## Key Implementation Details
@@ -218,7 +220,7 @@ Tests: `t.TempDir()/<testname>.db`
 After building, launch the TUI:
 
 ```bash
-./clockwork tui
+./clockwork
 ```
 
 **Quick Start:**
