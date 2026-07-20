@@ -33,6 +33,10 @@ jobs:
         run: go test -v ./...
 
       - name: Build
+        # Match the release build's linkage so a dependency that quietly needs
+        # cgo fails here rather than in a release artifact.
+        env:
+          CGO_ENABLED: 0
         run: go build -v ./cmd/clockwork
 
   release:
@@ -66,6 +70,13 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          # Go only disables cgo automatically when CROSS-compiling. The runner
+          # is linux/amd64, so that one matrix cell was a native build with the
+          # default CGO_ENABLED=1 and came out dynamically linked against the
+          # runner's glibc — unusable on musl targets (Alpine containers), which
+          # fail with a misleading "not found" for the missing ELF interpreter.
+          # Pinning 0 makes every cell a static binary with no libc dependency.
+          CGO_ENABLED: 0
         run: |
           BINARY_NAME="clockwork-${{ steps.version.outputs.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}"
           if [ "${{ matrix.goos }}" = "windows" ]; then
