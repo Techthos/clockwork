@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/techthos/clockwork/internal/models"
+	"github.com/techthos/clockwork/internal/source"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -100,12 +102,60 @@ func validateCommitHash(hash string) error {
 	return nil
 }
 
+// ProjectInput carries the fields needed to create a project. SourceType may
+// be left empty, in which case it is inferred from whichever locator is set.
+type ProjectInput struct {
+	Name        string
+	SourceType  string
+	GitRepoPath string
+	Repository  string
+}
+
+// ProjectUpdate carries partial project changes. A nil field is left
+// untouched; a non-nil field is written, including when it is empty, which is
+// how a locator gets cleared.
+type ProjectUpdate struct {
+	Name        *string
+	SourceType  *string
+	GitRepoPath *string
+	Repository  *string
+}
+
+// normalizeProject fills in the effective source type for rows written before
+// source_type existed, so callers always observe a concrete value.
+func normalizeProject(p *models.Project) *models.Project {
+	p.SourceType = source.Resolve(p).String()
+	return p
+}
+
 // CreateProject creates a new project
-func (s *Store) CreateProject(name, gitRepoPath string) (*models.Project, error) {
+func (s *Store) CreateProject(in ProjectInput) (*models.Project, error) {
+	name := strings.TrimSpace(in.Name)
+	if name == "" {
+		return nil, fmt.Errorf("project name must not be empty")
+	}
+
+	var srcType source.Type
+	if raw := strings.TrimSpace(in.SourceType); raw != "" {
+		parsed, err := source.Parse(raw)
+		if err != nil {
+			return nil, err
+		}
+		srcType = parsed
+	} else {
+		srcType = source.Infer(in.GitRepoPath, in.Repository)
+	}
+
+	if err := source.Validate(srcType, in.GitRepoPath, in.Repository); err != nil {
+		return nil, err
+	}
+
 	project := &models.Project{
 		ID:          uuid.New().String(),
 		Name:        name,
-		GitRepoPath: gitRepoPath,
+		SourceType:  srcType.String(),
+		GitRepoPath: in.GitRepoPath,
+		Repository:  in.Repository,
 		CreatedAt:   time.Now(),
 		UpdatedAt:   time.Now(),
 	}
@@ -149,11 +199,13 @@ func (s *Store) GetProject(id string) (*models.Project, error) {
 		return nil, err
 	}
 
-	return &project, nil
+	return normalizeProject(&project), nil
 }
 
-// UpdateProject updates an existing project
-func (s *Store) UpdateProject(id, name, gitRepoPath string) (*models.Project, error) {
+// UpdateProject applies a partial update to an existing project. Switching
+// source type clears the locator that no longer applies, so a project can move
+// between lookup methods without leaving stale fields behind.
+func (s *Store) UpdateProject(id string, upd ProjectUpdate) (*models.Project, error) {
 	var project models.Project
 
 	err := s.db.Update(func(tx *bolt.Tx) error {
@@ -169,13 +221,52 @@ func (s *Store) UpdateProject(id, name, gitRepoPath string) (*models.Project, er
 		if err := json.Unmarshal(data, &project); err != nil {
 			return err
 		}
+		normalizeProject(&project)
 
-		if name != "" {
-			project.Name = name
+		if upd.Name != nil {
+			if strings.TrimSpace(*upd.Name) == "" {
+				return fmt.Errorf("project name must not be empty")
+			}
+			project.Name = strings.TrimSpace(*upd.Name)
 		}
-		if gitRepoPath != "" {
-			project.GitRepoPath = gitRepoPath
+
+		srcType := source.Resolve(&project)
+		if upd.SourceType != nil {
+			parsed, err := source.Parse(*upd.SourceType)
+			if err != nil {
+				return err
+			}
+			srcType = parsed
 		}
+
+		// Reject locators that contradict the resolved type outright; silently
+		// drop leftovers from the previous type further down.
+		if upd.GitRepoPath != nil && *upd.GitRepoPath != "" && srcType != source.Local {
+			return fmt.Errorf("git_repo_path only applies to source type %q, not %q", source.Local, srcType)
+		}
+		if upd.Repository != nil && *upd.Repository != "" && srcType != source.MCP {
+			return fmt.Errorf("repository only applies to source type %q, not %q", source.MCP, srcType)
+		}
+		if upd.GitRepoPath != nil {
+			project.GitRepoPath = *upd.GitRepoPath
+		}
+		if upd.Repository != nil {
+			project.Repository = *upd.Repository
+		}
+
+		switch srcType {
+		case source.None:
+			project.GitRepoPath, project.Repository = "", ""
+		case source.Local:
+			project.Repository = ""
+		case source.MCP:
+			project.GitRepoPath = ""
+		}
+
+		if err := source.Validate(srcType, project.GitRepoPath, project.Repository); err != nil {
+			return err
+		}
+		project.SourceType = srcType.String()
 		project.UpdatedAt = time.Now()
 
 		updatedData, err := json.Marshal(project)
@@ -252,7 +343,7 @@ func (s *Store) ListProjects() ([]*models.Project, error) {
 			if err := json.Unmarshal(v, &project); err != nil {
 				return err
 			}
-			projects = append(projects, &project)
+			projects = append(projects, normalizeProject(&project))
 			return nil
 		})
 	})

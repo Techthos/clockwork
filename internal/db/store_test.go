@@ -1,10 +1,14 @@
 package db
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/techthos/clockwork/internal/models"
+	bolt "go.etcd.io/bbolt"
 )
 
 func setupTestDB(t *testing.T) (*Store, string) {
@@ -23,7 +27,7 @@ func TestCreateAndGetProject(t *testing.T) {
 	store, _ := setupTestDB(t)
 	defer store.Close()
 
-	project, err := store.CreateProject("Test Project", "/path/to/repo")
+	project, err := store.CreateProject(ProjectInput{Name: "Test Project", GitRepoPath: "/path/to/repo"})
 	if err != nil {
 		t.Fatalf("Failed to create project: %v", err)
 	}
@@ -46,9 +50,10 @@ func TestUpdateProject(t *testing.T) {
 	store, _ := setupTestDB(t)
 	defer store.Close()
 
-	project, _ := store.CreateProject("Original", "/path/1")
+	project, _ := store.CreateProject(ProjectInput{Name: "Original", GitRepoPath: "/path/1"})
 
-	updated, err := store.UpdateProject(project.ID, "Updated", "/path/2")
+	name, path := "Updated", "/path/2"
+	updated, err := store.UpdateProject(project.ID, ProjectUpdate{Name: &name, GitRepoPath: &path})
 	if err != nil {
 		t.Fatalf("Failed to update project: %v", err)
 	}
@@ -66,7 +71,7 @@ func TestDeleteProject(t *testing.T) {
 	store, _ := setupTestDB(t)
 	defer store.Close()
 
-	project, _ := store.CreateProject("To Delete", "/path")
+	project, _ := store.CreateProject(ProjectInput{Name: "To Delete", GitRepoPath: "/path"})
 
 	err := store.DeleteProject(project.ID)
 	if err != nil {
@@ -83,8 +88,8 @@ func TestListProjects(t *testing.T) {
 	store, _ := setupTestDB(t)
 	defer store.Close()
 
-	store.CreateProject("Project 1", "/path/1")
-	store.CreateProject("Project 2", "/path/2")
+	store.CreateProject(ProjectInput{Name: "Project 1", GitRepoPath: "/path/1"})
+	store.CreateProject(ProjectInput{Name: "Project 2", GitRepoPath: "/path/2"})
 
 	projects, err := store.ListProjects()
 	if err != nil {
@@ -100,7 +105,7 @@ func TestCreateAndGetEntry(t *testing.T) {
 	store, _ := setupTestDB(t)
 	defer store.Close()
 
-	project, _ := store.CreateProject("Test", "/path")
+	project, _ := store.CreateProject(ProjectInput{Name: "Test", GitRepoPath: "/path"})
 
 	entry, err := store.CreateEntry(project.ID, 120, "Test work", "abc123", false, time.Now())
 	if err != nil {
@@ -125,7 +130,7 @@ func TestUpdateEntry(t *testing.T) {
 	store, _ := setupTestDB(t)
 	defer store.Close()
 
-	project, _ := store.CreateProject("Test", "/path")
+	project, _ := store.CreateProject(ProjectInput{Name: "Test", GitRepoPath: "/path"})
 	entry, _ := store.CreateEntry(project.ID, 60, "Original", "abc", false, time.Now())
 
 	newDuration := int64(120)
@@ -154,7 +159,7 @@ func TestListEntries(t *testing.T) {
 	store, _ := setupTestDB(t)
 	defer store.Close()
 
-	project, _ := store.CreateProject("Test", "/path")
+	project, _ := store.CreateProject(ProjectInput{Name: "Test", GitRepoPath: "/path"})
 	store.CreateEntry(project.ID, 60, "Entry 1", "abc", false, time.Now())
 	store.CreateEntry(project.ID, 90, "Entry 2", "def", false, time.Now())
 
@@ -172,7 +177,7 @@ func TestGetLastEntry(t *testing.T) {
 	store, _ := setupTestDB(t)
 	defer store.Close()
 
-	project, _ := store.CreateProject("Test", "/path")
+	project, _ := store.CreateProject(ProjectInput{Name: "Test", GitRepoPath: "/path"})
 
 	// No entries yet
 	last, err := store.GetLastEntry(project.ID)
@@ -207,7 +212,7 @@ func TestDatabasePersistence(t *testing.T) {
 		t.Fatalf("Failed to create database: %v", err)
 	}
 
-	project, _ := store1.CreateProject("Persistent", "/path")
+	project, _ := store1.CreateProject(ProjectInput{Name: "Persistent", GitRepoPath: "/path"})
 	store1.Close()
 
 	// Reopen database
@@ -231,7 +236,7 @@ func TestDeleteProjectCascade(t *testing.T) {
 	store, _ := setupTestDB(t)
 	defer store.Close()
 
-	project, _ := store.CreateProject("Test", "/path")
+	project, _ := store.CreateProject(ProjectInput{Name: "Test", GitRepoPath: "/path"})
 	store.CreateEntry(project.ID, 60, "Entry 1", "abc", false, time.Now())
 	store.CreateEntry(project.ID, 90, "Entry 2", "def", false, time.Now())
 
@@ -254,8 +259,8 @@ func TestListEntriesFiltered(t *testing.T) {
 	store, _ := setupTestDB(t)
 	defer store.Close()
 
-	project1, _ := store.CreateProject("Project 1", "/path/1")
-	project2, _ := store.CreateProject("Project 2", "/path/2")
+	project1, _ := store.CreateProject(ProjectInput{Name: "Project 1", GitRepoPath: "/path/1"})
+	project2, _ := store.CreateProject(ProjectInput{Name: "Project 2", GitRepoPath: "/path/2"})
 
 	// Create entries with different invoiced statuses
 	store.CreateEntry(project1.ID, 60, "Entry 1 - Not Invoiced", "abc", false, time.Now())
@@ -324,8 +329,8 @@ func TestListEntriesFilteredByDateRange(t *testing.T) {
 	store, _ := setupTestDB(t)
 	defer store.Close()
 
-	project1, _ := store.CreateProject("Project 1", "/path/1")
-	project2, _ := store.CreateProject("Project 2", "/path/2")
+	project1, _ := store.CreateProject(ProjectInput{Name: "Project 1", GitRepoPath: "/path/1"})
+	project2, _ := store.CreateProject(ProjectInput{Name: "Project 2", GitRepoPath: "/path/2"})
 
 	// Create entries with specific dates
 	jan1 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
@@ -426,14 +431,14 @@ func TestGetStatistics(t *testing.T) {
 	store, _ := setupTestDB(t)
 	defer store.Close()
 
-	project1, _ := store.CreateProject("Project 1", "/path/1")
-	project2, _ := store.CreateProject("Project 2", "/path/2")
+	project1, _ := store.CreateProject(ProjectInput{Name: "Project 1", GitRepoPath: "/path/1"})
+	project2, _ := store.CreateProject(ProjectInput{Name: "Project 2", GitRepoPath: "/path/2"})
 
 	// Create entries with different properties
-	store.CreateEntry(project1.ID, 60, "Entry 1", "abc", false, time.Now())   // 1 hour, not invoiced
-	store.CreateEntry(project1.ID, 90, "Entry 2", "def", true, time.Now())    // 1.5 hours, invoiced
-	store.CreateEntry(project2.ID, 120, "Entry 3", "ghi", false, time.Now())  // 2 hours, not invoiced
-	store.CreateEntry(project2.ID, 150, "Entry 4", "jkl", true, time.Now())   // 2.5 hours, invoiced
+	store.CreateEntry(project1.ID, 60, "Entry 1", "abc", false, time.Now())  // 1 hour, not invoiced
+	store.CreateEntry(project1.ID, 90, "Entry 2", "def", true, time.Now())   // 1.5 hours, invoiced
+	store.CreateEntry(project2.ID, 120, "Entry 3", "ghi", false, time.Now()) // 2 hours, not invoiced
+	store.CreateEntry(project2.ID, 150, "Entry 4", "jkl", true, time.Now())  // 2.5 hours, invoiced
 
 	// Test: All statistics (no filters)
 	stats, err := store.GetStatistics("", nil, nil, nil)
@@ -532,7 +537,7 @@ func TestCreateEntryWithCustomDate(t *testing.T) {
 	store, _ := setupTestDB(t)
 	defer store.Close()
 
-	project, _ := store.CreateProject("Test", "/path")
+	project, _ := store.CreateProject(ProjectInput{Name: "Test", GitRepoPath: "/path"})
 
 	// Create entry with custom date
 	customDate := time.Date(2025, 12, 15, 14, 30, 0, 0, time.UTC)
@@ -561,7 +566,7 @@ func TestUpdateEntryWithCustomDate(t *testing.T) {
 	store, _ := setupTestDB(t)
 	defer store.Close()
 
-	project, _ := store.CreateProject("Test", "/path")
+	project, _ := store.CreateProject(ProjectInput{Name: "Test", GitRepoPath: "/path"})
 
 	// Create entry with current time
 	originalDate := time.Now()
@@ -594,6 +599,141 @@ func TestUpdateEntryWithCustomDate(t *testing.T) {
 	// Verify message was updated
 	if updated2.Message != "Updated message" {
 		t.Errorf("Expected message 'Updated message', got '%s'", updated2.Message)
+	}
+}
+
+func TestCreateProjectSourceTypes(t *testing.T) {
+	store, _ := setupTestDB(t)
+	defer store.Close()
+
+	tests := []struct {
+		name    string
+		input   ProjectInput
+		want    string
+		wantErr bool
+	}{
+		{"repository is optional", ProjectInput{Name: "No repo"}, "none", false},
+		{"inferred from path", ProjectInput{Name: "Inferred local", GitRepoPath: "/repo"}, "local", false},
+		{"inferred from repository", ProjectInput{Name: "Inferred mcp", Repository: "owner/name"}, "mcp", false},
+		{"explicit none", ProjectInput{Name: "Explicit none", SourceType: "none"}, "none", false},
+		{"explicit mcp", ProjectInput{Name: "Explicit mcp", SourceType: "mcp", Repository: "owner/name"}, "mcp", false},
+		{"local without path", ProjectInput{Name: "Bad local", SourceType: "local"}, "", true},
+		{"mcp without repository", ProjectInput{Name: "Bad mcp", SourceType: "mcp"}, "", true},
+		{"none with a path", ProjectInput{Name: "Bad none", SourceType: "none", GitRepoPath: "/repo"}, "", true},
+		{"unknown source type", ProjectInput{Name: "Bad type", SourceType: "api"}, "", true},
+		{"empty name", ProjectInput{Name: "  "}, "", true},
+	}
+
+	for _, tt := range tests {
+		project, err := store.CreateProject(tt.input)
+		if tt.wantErr {
+			if err == nil {
+				t.Errorf("%s: expected error, got project %+v", tt.name, project)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: unexpected error: %v", tt.name, err)
+			continue
+		}
+		if project.SourceType != tt.want {
+			t.Errorf("%s: SourceType = %q, want %q", tt.name, project.SourceType, tt.want)
+		}
+	}
+}
+
+func TestUpdateProjectSwitchingSourceClearsStaleLocator(t *testing.T) {
+	store, _ := setupTestDB(t)
+	defer store.Close()
+
+	project, err := store.CreateProject(ProjectInput{Name: "Switcher", GitRepoPath: "/repo"})
+	if err != nil {
+		t.Fatalf("Failed to create project: %v", err)
+	}
+
+	sourceType, repository := "mcp", "owner/name"
+	updated, err := store.UpdateProject(project.ID, ProjectUpdate{
+		SourceType: &sourceType,
+		Repository: &repository,
+	})
+	if err != nil {
+		t.Fatalf("Failed to switch to mcp: %v", err)
+	}
+	if updated.SourceType != "mcp" {
+		t.Errorf("SourceType = %q, want 'mcp'", updated.SourceType)
+	}
+	if updated.Repository != "owner/name" {
+		t.Errorf("Repository = %q, want 'owner/name'", updated.Repository)
+	}
+	if updated.GitRepoPath != "" {
+		t.Errorf("GitRepoPath should have been cleared, got %q", updated.GitRepoPath)
+	}
+
+	// Dropping the repository entirely leaves a project with no source.
+	noneType := "none"
+	updated, err = store.UpdateProject(project.ID, ProjectUpdate{SourceType: &noneType})
+	if err != nil {
+		t.Fatalf("Failed to switch to none: %v", err)
+	}
+	if updated.SourceType != "none" || updated.Repository != "" || updated.GitRepoPath != "" {
+		t.Errorf("expected a bare project, got %+v", updated)
+	}
+}
+
+func TestUpdateProjectRejectsMismatchedLocator(t *testing.T) {
+	store, _ := setupTestDB(t)
+	defer store.Close()
+
+	project, _ := store.CreateProject(ProjectInput{Name: "Strict", GitRepoPath: "/repo"})
+
+	repository := "owner/name"
+	if _, err := store.UpdateProject(project.ID, ProjectUpdate{Repository: &repository}); err == nil {
+		t.Error("expected error setting repository on a local project")
+	}
+
+	emptyName := ""
+	if _, err := store.UpdateProject(project.ID, ProjectUpdate{Name: &emptyName}); err == nil {
+		t.Error("expected error clearing the project name")
+	}
+}
+
+func TestGetProjectNormalizesLegacyRows(t *testing.T) {
+	store, _ := setupTestDB(t)
+	defer store.Close()
+
+	// Rows written before source_type existed carry an empty value; reads
+	// should report the method inferred from the locator.
+	project, _ := store.CreateProject(ProjectInput{Name: "Legacy", GitRepoPath: "/repo"})
+	if err := store.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(projectsBucket))
+		var stored models.Project
+		if err := json.Unmarshal(b.Get([]byte(project.ID)), &stored); err != nil {
+			return err
+		}
+		stored.SourceType = ""
+		data, err := json.Marshal(stored)
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte(project.ID), data)
+	}); err != nil {
+		t.Fatalf("Failed to write legacy row: %v", err)
+	}
+
+	retrieved, err := store.GetProject(project.ID)
+	if err != nil {
+		t.Fatalf("Failed to get project: %v", err)
+	}
+	if retrieved.SourceType != "local" {
+		t.Errorf("SourceType = %q, want 'local'", retrieved.SourceType)
+	}
+
+	projects, err := store.ListProjects()
+	if err != nil {
+		t.Fatalf("Failed to list projects: %v", err)
+	}
+	if len(projects) != 1 || projects[0].SourceType != "local" {
+		t.Errorf("ListProjects did not normalize legacy rows: %+v", projects)
 	}
 }
 

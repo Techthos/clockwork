@@ -7,6 +7,7 @@ import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 	"github.com/techthos/clockwork/internal/models"
+	"github.com/techthos/clockwork/internal/source"
 )
 
 func (a *App) createProjectsView() tview.Primitive {
@@ -50,11 +51,15 @@ func (a *App) createProjectsView() tview.Primitive {
 			SetTextColor(ColorTableHeader).
 			SetAlign(tview.AlignLeft).
 			SetSelectable(false))
-		table.SetCell(0, 1, tview.NewTableCell("Git Repository").
+		table.SetCell(0, 1, tview.NewTableCell("Source").
 			SetTextColor(ColorTableHeader).
 			SetAlign(tview.AlignLeft).
 			SetSelectable(false))
-		table.SetCell(0, 2, tview.NewTableCell("Created").
+		table.SetCell(0, 2, tview.NewTableCell("Repository").
+			SetTextColor(ColorTableHeader).
+			SetAlign(tview.AlignLeft).
+			SetSelectable(false))
+		table.SetCell(0, 3, tview.NewTableCell("Created").
 			SetTextColor(ColorTableHeader).
 			SetAlign(tview.AlignLeft).
 			SetSelectable(false))
@@ -62,12 +67,18 @@ func (a *App) createProjectsView() tview.Primitive {
 		// Add project rows
 		for i, project := range projects {
 			row := i + 1
+			locator := source.Locator(project)
+			if locator == "" {
+				locator = "-"
+			}
 			table.SetCell(row, 0, tview.NewTableCell(project.Name).
 				SetTextColor(ColorTableText).
 				SetReference(project))
-			table.SetCell(row, 1, tview.NewTableCell(project.GitRepoPath).
+			table.SetCell(row, 1, tview.NewTableCell(source.Resolve(project).String()).
 				SetTextColor(ColorTableText))
-			table.SetCell(row, 2, tview.NewTableCell(FormatDate(project.CreatedAt)).
+			table.SetCell(row, 2, tview.NewTableCell(locator).
+				SetTextColor(ColorTableText))
+			table.SetCell(row, 3, tview.NewTableCell(FormatDate(project.CreatedAt)).
 				SetTextColor(ColorTableText))
 		}
 

@@ -8,6 +8,7 @@ import (
 	"github.com/rivo/tview"
 	"github.com/techthos/clockwork/internal/git"
 	"github.com/techthos/clockwork/internal/models"
+	"github.com/techthos/clockwork/internal/source"
 	"github.com/techthos/clockwork/internal/utils"
 )
 
@@ -27,7 +28,37 @@ func (a *App) ShowEntryForm(entry *models.Entry, defaultProjectID string, onComp
 	a.showManualEntryForm(entry, onComplete)
 }
 
+// localProjects returns the projects whose commits the TUI can read on its
+// own. Projects with source "mcp" are excluded: their commits are supplied by
+// an AI client, which is only present in MCP mode.
+func (a *App) localProjects() ([]*models.Project, error) {
+	projects, err := a.store.ListProjects()
+	if err != nil {
+		return nil, err
+	}
+
+	local := make([]*models.Project, 0, len(projects))
+	for _, project := range projects {
+		if source.Resolve(project) == source.Local {
+			local = append(local, project)
+		}
+	}
+	return local, nil
+}
+
 func (a *App) showEntryModeSelection(defaultProjectID string, onComplete func()) {
+	// Offering git mode when nothing can supply commits would only lead to a
+	// dead end, so fall through to manual entry instead.
+	local, err := a.localProjects()
+	if err != nil {
+		a.ShowErrorModal(fmt.Sprintf("Failed to load projects: %v", err), nil)
+		return
+	}
+	if len(local) == 0 {
+		a.showManualEntryForm(nil, onComplete)
+		return
+	}
+
 	modal := tview.NewModal().
 		SetText("Select entry creation mode:").
 		AddButtons([]string{"Git (from commits)", "Manual", "Cancel"}).
@@ -50,15 +81,15 @@ func (a *App) showEntryModeSelection(defaultProjectID string, onComplete func())
 func (a *App) showGitEntryForm(defaultProjectID string, onComplete func()) {
 	form := tview.NewForm()
 
-	// Get list of projects
-	projects, err := a.store.ListProjects()
+	// Only local projects can be read from here.
+	projects, err := a.localProjects()
 	if err != nil {
 		a.ShowErrorModal(fmt.Sprintf("Failed to load projects: %v", err), nil)
 		return
 	}
 
 	if len(projects) == 0 {
-		a.ShowErrorModal("No projects available. Create a project first.", nil)
+		a.ShowErrorModal("No projects with a local git repository. Set a project's source to 'local', or create the entry manually.", nil)
 		return
 	}
 
@@ -118,6 +149,12 @@ func (a *App) showGitEntryForm(defaultProjectID string, onComplete func()) {
 			return
 		}
 
+		// A baseline that no longer exists (rebase, force push, fresh clone) is
+		// discarded rather than failing the whole operation.
+		if sinceHash != "" && !git.ValidateCommitHash(selectedProject.GitRepoPath, sinceHash) {
+			sinceHash = ""
+		}
+
 		var commits []models.CommitInfo
 		if sinceHash != "" {
 			commits, err = git.GetCommitsSince(selectedProject.GitRepoPath, sinceHash)
@@ -157,8 +194,13 @@ func (a *App) showGitEntryForm(defaultProjectID string, onComplete func()) {
 			message = customMessage
 		}
 
-		// Get latest commit hash
-		latestHash := commits[0].Hash
+		// Read HEAD rather than trusting git log ordering, so the stored
+		// baseline goes through the same validation as everywhere else.
+		latestHash, err := git.GetLatestCommitHash(selectedProject.GitRepoPath)
+		if err != nil {
+			a.ShowErrorModal(fmt.Sprintf("Failed to get latest commit hash: %v", err), nil)
+			return
+		}
 
 		// Create entry
 		_, err = a.store.CreateEntry(

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -12,6 +14,7 @@ import (
 	"github.com/techthos/clockwork/internal/db"
 	"github.com/techthos/clockwork/internal/git"
 	"github.com/techthos/clockwork/internal/models"
+	"github.com/techthos/clockwork/internal/source"
 	"github.com/techthos/clockwork/internal/utils"
 )
 
@@ -37,12 +40,21 @@ func New() (*ClockworkServer, error) {
 	mcpServer := server.NewMCPServer(
 		"clockwork",
 		"1.0.0",
-		server.WithInstructions(`Automatically track work time based on git commits of a project.
+		server.WithInstructions(`Automatically track work time based on the commits of a project.
+
+A repository is optional. Each project declares how its commits are found via
+source_type:
+- "none"  - no repository; only manual entries are possible
+- "local" - a git repository on this machine; clockwork reads it itself
+- "mcp"   - clockwork cannot see the repository. You look the commits up (via a
+            repository MCP server, an API, or any other means) and pass them to
+            create_entry in the "commits" array. Call get_commit_baseline first
+            to learn which commit to start from.
 
 Examples:
-- "track 2h" - Create entry with 2 hours from recent git commits
+- "track 2h" - Create entry with 2 hours from recent commits
 - "clockwork 1h" - Create entry with 1 hour from recent commits
-- "book 1h meeting with alex" - Manual entry without git commit aggregation`),
+- "book 1h meeting with alex" - Manual entry without commit aggregation`),
 	)
 
 	cs := &ClockworkServer{
@@ -89,6 +101,83 @@ func argsMap(request mcp.CallToolRequest) map[string]interface{} {
 	return map[string]interface{}{}
 }
 
+// optionalString returns a pointer to the value at key when the caller sent
+// that key, and nil when it was omitted. The distinction matters for partial
+// updates: an empty string is a request to clear a field.
+func optionalString(args map[string]interface{}, key string) *string {
+	raw, ok := args[key]
+	if !ok {
+		return nil
+	}
+	str, ok := raw.(string)
+	if !ok {
+		return nil
+	}
+	return &str
+}
+
+// parseCommitTimestamp accepts either an RFC3339 string or unix seconds, since
+// different repository APIs report commit times differently.
+func parseCommitTimestamp(raw interface{}) (time.Time, error) {
+	switch v := raw.(type) {
+	case nil:
+		return time.Time{}, nil
+	case float64:
+		return time.Unix(int64(v), 0), nil
+	case string:
+		if v == "" {
+			return time.Time{}, nil
+		}
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			return t, nil
+		}
+		if secs, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return time.Unix(secs, 0), nil
+		}
+		return time.Time{}, fmt.Errorf("expected RFC3339 or unix seconds, got %q", v)
+	default:
+		return time.Time{}, fmt.Errorf("expected RFC3339 string or unix seconds, got %T", raw)
+	}
+}
+
+// parseSuppliedCommits converts the caller-provided commits array into
+// CommitInfo. Used when a project's commits are looked up by the client rather
+// than read from disk.
+func parseSuppliedCommits(raw interface{}) ([]models.CommitInfo, error) {
+	list, ok := raw.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("commits must be an array")
+	}
+
+	commits := make([]models.CommitInfo, 0, len(list))
+	for i, item := range list {
+		obj, ok := item.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("commits[%d] must be an object", i)
+		}
+
+		message, _ := obj["message"].(string)
+		if strings.TrimSpace(message) == "" {
+			return nil, fmt.Errorf("commits[%d].message is required", i)
+		}
+		hash, _ := obj["hash"].(string)
+		author, _ := obj["author"].(string)
+
+		timestamp, err := parseCommitTimestamp(obj["timestamp"])
+		if err != nil {
+			return nil, fmt.Errorf("commits[%d].timestamp: %w", i, err)
+		}
+
+		commits = append(commits, models.CommitInfo{
+			Hash:      hash,
+			Author:    author,
+			Message:   message,
+			Timestamp: timestamp,
+		})
+	}
+	return commits, nil
+}
+
 // jsonResult marshals v to indented JSON and wraps it in an MCP tool result.
 // If marshaling fails, an error result is returned instead of silently
 // emitting invalid JSON.
@@ -112,6 +201,8 @@ func (s *ClockworkServer) registerTools() {
 	s.registerDeleteProject()
 	s.registerListProjects()
 
+	s.registerGetCommitBaseline()
+
 	// Entry tools
 	s.registerCreateEntry()
 	s.registerUpdateEntry()
@@ -120,11 +211,25 @@ func (s *ClockworkServer) registerTools() {
 	s.registerGetStatistics()
 }
 
+// sourceTypeDescription documents the lookup methods for the tool schemas.
+func sourceTypeDescription() string {
+	parts := make([]string, 0, len(source.All()))
+	for _, t := range source.All() {
+		parts = append(parts, fmt.Sprintf("'%s' (%s)", t, source.Describe(t)))
+	}
+	return "How commits are looked up for this project: " + strings.Join(parts, ", ")
+}
+
 func (s *ClockworkServer) registerCreateProject() {
 	tool := mcp.NewTool("create_project",
-		mcp.WithDescription("Create a new project for time tracking"),
+		mcp.WithDescription("Create a new project for time tracking. A repository is optional: projects with source_type 'none' track manual entries only."),
 		mcp.WithString("name", mcp.Required(), mcp.Description("Project name")),
-		mcp.WithString("git_repo_path", mcp.Required(), mcp.Description("Path to git repository")),
+		mcp.WithString("source_type",
+			mcp.Enum(string(source.None), string(source.Local), string(source.MCP)),
+			mcp.Description(sourceTypeDescription()+". Defaults to 'local' if git_repo_path is given, 'mcp' if repository is given, otherwise 'none'."),
+		),
+		mcp.WithString("git_repo_path", mcp.Description("Path to a git repository on this filesystem. Only for source_type 'local'.")),
+		mcp.WithString("repository", mcp.Description("Repository identifier you will use to look up commits yourself, e.g. 'owner/name' or a clone URL. Only for source_type 'mcp'.")),
 	)
 
 	s.mcp.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -132,19 +237,35 @@ func (s *ClockworkServer) registerCreateProject() {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		gitRepoPath, err := getRequiredString(request, "git_repo_path")
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+		args := argsMap(request)
+
+		sourceType, _ := args["source_type"].(string)
+		gitRepoPath, _ := args["git_repo_path"].(string)
+		repository, _ := args["repository"].(string)
+
+		resolved := source.Infer(gitRepoPath, repository)
+		if sourceType != "" {
+			parsed, err := source.Parse(sourceType)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			resolved = parsed
 		}
 
-		// Validate that the git repo path exists on disk and is a directory.
-		if info, err := os.Stat(gitRepoPath); err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("git_repo_path not accessible: %v", err)), nil
-		} else if !info.IsDir() {
-			return mcp.NewToolResultError("git_repo_path must be a directory"), nil
+		// A local source is the only one clockwork reads itself, so it is the
+		// only one whose locator can be checked here.
+		if resolved == source.Local {
+			if err := git.IsRepo(gitRepoPath); err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("git_repo_path is not usable: %v", err)), nil
+			}
 		}
 
-		project, err := s.store.CreateProject(name, gitRepoPath)
+		project, err := s.store.CreateProject(db.ProjectInput{
+			Name:        name,
+			SourceType:  resolved.String(),
+			GitRepoPath: gitRepoPath,
+			Repository:  repository,
+		})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -155,10 +276,15 @@ func (s *ClockworkServer) registerCreateProject() {
 
 func (s *ClockworkServer) registerUpdateProject() {
 	tool := mcp.NewTool("update_project",
-		mcp.WithDescription("Update an existing project"),
+		mcp.WithDescription("Update an existing project. Switching source_type clears the locator that no longer applies."),
 		mcp.WithString("id", mcp.Required(), mcp.Description("Project ID")),
 		mcp.WithString("name", mcp.Description("New project name (optional)")),
-		mcp.WithString("git_repo_path", mcp.Description("New git repository path (optional)")),
+		mcp.WithString("source_type",
+			mcp.Enum(string(source.None), string(source.Local), string(source.MCP)),
+			mcp.Description(sourceTypeDescription()+" (optional)"),
+		),
+		mcp.WithString("git_repo_path", mcp.Description("New git repository path (optional). Pass an empty string to clear it.")),
+		mcp.WithString("repository", mcp.Description("New repository identifier (optional). Pass an empty string to clear it.")),
 	)
 
 	s.mcp.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -168,26 +294,67 @@ func (s *ClockworkServer) registerUpdateProject() {
 		}
 		args := argsMap(request)
 
-		name, _ := args["name"].(string)
-		gitRepoPath, _ := args["git_repo_path"].(string)
-
-		if name == "" && gitRepoPath == "" {
-			return mcp.NewToolResultError("at least one of 'name' or 'git_repo_path' must be provided"), nil
+		// Presence, not emptiness, decides what gets written — that is what
+		// makes clearing a locator possible.
+		upd := db.ProjectUpdate{
+			Name:        optionalString(args, "name"),
+			SourceType:  optionalString(args, "source_type"),
+			GitRepoPath: optionalString(args, "git_repo_path"),
+			Repository:  optionalString(args, "repository"),
 		}
-		if gitRepoPath != "" {
-			if info, err := os.Stat(gitRepoPath); err != nil {
-				return mcp.NewToolResultError(fmt.Sprintf("git_repo_path not accessible: %v", err)), nil
-			} else if !info.IsDir() {
-				return mcp.NewToolResultError("git_repo_path must be a directory"), nil
+		if upd.Name == nil && upd.SourceType == nil && upd.GitRepoPath == nil && upd.Repository == nil {
+			return mcp.NewToolResultError("at least one of 'name', 'source_type', 'git_repo_path' or 'repository' must be provided"), nil
+		}
+
+		if upd.GitRepoPath != nil && *upd.GitRepoPath != "" {
+			if err := git.IsRepo(*upd.GitRepoPath); err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("git_repo_path is not usable: %v", err)), nil
 			}
 		}
 
-		project, err := s.store.UpdateProject(id, name, gitRepoPath)
+		project, err := s.store.UpdateProject(id, upd)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
 		return jsonResult(project), nil
+	})
+}
+
+// registerGetCommitBaseline exposes what a client needs in order to look
+// commits up on clockwork's behalf: the lookup method, the repository
+// identifier, and the commit the last entry stopped at.
+func (s *ClockworkServer) registerGetCommitBaseline() {
+	tool := mcp.NewTool("get_commit_baseline",
+		mcp.WithDescription("Get a project's commit lookup method and the commit hash the last entry stopped at. For source_type 'mcp', call this first, fetch the commits after that hash yourself, then pass them to create_entry."),
+		mcp.WithString("project_id", mcp.Required(), mcp.Description("Project ID")),
+	)
+
+	s.mcp.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		projectID, err := getRequiredString(request, "project_id")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		project, err := s.store.GetProject(projectID)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("project not found: %v", err)), nil
+		}
+
+		lastHash, err := s.store.GetLastCommitHash(projectID)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		srcType := source.Resolve(project)
+		return jsonResult(map[string]interface{}{
+			"project_id":                 project.ID,
+			"project_name":               project.Name,
+			"source_type":                srcType.String(),
+			"repository":                 source.Locator(project),
+			"last_commit_hash":           lastHash,
+			"commits_supplied_by_caller": srcType.SuppliesCommits(),
+		}), nil
 	})
 }
 
@@ -235,6 +402,19 @@ func (s *ClockworkServer) registerCreateEntry() {
 		mcp.WithBoolean("manual", mcp.Description("Skip git commit aggregation (default: false)")),
 		mcp.WithString("duration", mcp.Description("Duration in format '1h 30m' or '90m' (required when manual=true, optional override otherwise)")),
 		mcp.WithString("created_at", mcp.Description("Entry creation datetime in RFC3339 format (optional, e.g., '2026-01-15T14:30:00Z')")),
+		mcp.WithArray("commits",
+			mcp.Description("Commits you looked up yourself, for projects with source_type 'mcp'. Clockwork does not fetch these — call get_commit_baseline, retrieve the commits after that hash with your own repository tools, and pass them here. Ignored for source_type 'local'."),
+			mcp.Items(map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"hash":      map[string]interface{}{"type": "string", "description": "Commit hash"},
+					"author":    map[string]interface{}{"type": "string", "description": "Commit author name"},
+					"message":   map[string]interface{}{"type": "string", "description": "Commit subject line"},
+					"timestamp": map[string]interface{}{"type": "string", "description": "Commit time as RFC3339 or unix seconds"},
+				},
+				"required": []string{"message"},
+			}),
+		),
 	)
 
 	s.mcp.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -266,6 +446,8 @@ func (s *ClockworkServer) registerCreateEntry() {
 			return mcp.NewToolResultError(fmt.Sprintf("project not found: %v", err)), nil
 		}
 
+		srcType := source.Resolve(project)
+
 		// Manual entry path
 		if manual {
 			if durationStr == "" {
@@ -282,11 +464,16 @@ func (s *ClockworkServer) registerCreateEntry() {
 				message = "Manual entry"
 			}
 
-			// Best-effort attempt to record current HEAD; degrade gracefully but log warning.
-			currentHash, hashErr := git.GetLatestCommitHash(project.GitRepoPath)
-			if hashErr != nil {
-				fmt.Fprintf(os.Stderr, "warning: could not read git HEAD for manual entry (project %s): %v\n", projectID, hashErr)
-				currentHash = ""
+			// Only a local repository can be probed for HEAD, and even then the
+			// entry stands on its own if git is unavailable.
+			currentHash := ""
+			if srcType == source.Local {
+				hash, hashErr := git.GetLatestCommitHash(project.GitRepoPath)
+				if hashErr != nil {
+					fmt.Fprintf(os.Stderr, "warning: could not read git HEAD for manual entry (project %s): %v\n", projectID, hashErr)
+				} else {
+					currentHash = hash
+				}
 			}
 
 			entry, err := s.store.CreateEntry(projectID, duration, message, currentHash, invoiced, createdAt)
@@ -300,42 +487,70 @@ func (s *ClockworkServer) registerCreateEntry() {
 			}), nil
 		}
 
-		// Git-based entry path
+		// Commit-based entry path. Where the commits come from depends entirely
+		// on the project's lookup method.
+		if srcType == source.None {
+			return mcp.NewToolResultError(fmt.Sprintf(
+				"project %q has no repository (source_type=none), so commits cannot be aggregated. Create the entry with manual=true and an explicit duration, or set a source with update_project.",
+				project.Name)), nil
+		}
 
-		// Find the most recent commit hash across all entries (skips manual entries without one)
+		// Baseline: the commit the previous entry stopped at.
 		sinceHash, err := s.store.GetLastCommitHash(projectID)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		// Validate that the commit hash still exists in the repository
-		if sinceHash != "" && !git.ValidateCommitHash(project.GitRepoPath, sinceHash) {
-			sinceHash = ""
-		}
-
 		var commits []models.CommitInfo
-		if sinceHash != "" {
-			commits, err = git.GetCommitsSince(project.GitRepoPath, sinceHash)
+		var latestHash string
+
+		if srcType.SuppliesCommits() {
+			rawCommits, provided := args["commits"]
+			if !provided {
+				return mcp.NewToolResultError(fmt.Sprintf(
+					"project %q uses source_type=mcp: clockwork does not look commits up itself. Fetch the commits for repository %q%s using your own repository tools, then call create_entry again with them in the 'commits' array. Alternatively pass manual=true with an explicit duration.",
+					project.Name, project.Repository, sinceDescription(sinceHash))), nil
+			}
+
+			commits, err = parseSuppliedCommits(rawCommits)
 			if err != nil {
-				return mcp.NewToolResultError(fmt.Sprintf("failed to get commits: %v", err)), nil
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			if len(commits) == 0 {
+				return mcp.NewToolResultError("the 'commits' array is empty: nothing to aggregate"), nil
+			}
+			if newest, ok := git.NewestCommit(commits); ok {
+				latestHash = newest.Hash
 			}
 		} else {
-			// No baseline — just grab HEAD as a single commit
-			commit, err := git.GetLatestCommit(project.GitRepoPath)
-			if err != nil {
-				return mcp.NewToolResultError(fmt.Sprintf("failed to get latest commit: %v", err)), nil
+			// Local repository: a baseline that no longer exists (rebase, force
+			// push, fresh clone) is discarded rather than failing the call.
+			if sinceHash != "" && !git.ValidateCommitHash(project.GitRepoPath, sinceHash) {
+				sinceHash = ""
 			}
-			commits = []models.CommitInfo{*commit}
-		}
 
-		if len(commits) == 0 {
-			return mcp.NewToolResultError("no new commits found since last entry"), nil
-		}
+			if sinceHash != "" {
+				commits, err = git.GetCommitsSince(project.GitRepoPath, sinceHash)
+				if err != nil {
+					return mcp.NewToolResultError(fmt.Sprintf("failed to get commits: %v", err)), nil
+				}
+			} else {
+				// No baseline — just grab HEAD as a single commit
+				commit, err := git.GetLatestCommit(project.GitRepoPath)
+				if err != nil {
+					return mcp.NewToolResultError(fmt.Sprintf("failed to get latest commit: %v", err)), nil
+				}
+				commits = []models.CommitInfo{*commit}
+			}
 
-		// Get latest commit hash
-		latestHash, err := git.GetLatestCommitHash(project.GitRepoPath)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			if len(commits) == 0 {
+				return mcp.NewToolResultError("no new commits found since last entry"), nil
+			}
+
+			latestHash, err = git.GetLatestCommitHash(project.GitRepoPath)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
 		}
 
 		// Calculate duration (use override if provided)
@@ -346,6 +561,9 @@ func (s *ClockworkServer) registerCreateEntry() {
 				return mcp.NewToolResultError(fmt.Sprintf("invalid duration: %v", err)), nil
 			}
 		} else {
+			if missingTimestamps(commits) {
+				return mcp.NewToolResultError("cannot calculate duration: one or more commits have no timestamp. Supply 'timestamp' on each commit (RFC3339 or unix seconds), or pass an explicit 'duration'."), nil
+			}
 			duration = git.CalculateDuration(commits)
 		}
 
@@ -365,8 +583,29 @@ func (s *ClockworkServer) registerCreateEntry() {
 			"entry":         entry,
 			"commits_found": len(commits),
 			"mode":          "git",
+			"source_type":   srcType.String(),
 		}), nil
 	})
+}
+
+// sinceDescription renders the baseline commit for the guidance returned to a
+// client that has to fetch commits itself.
+func sinceDescription(sinceHash string) string {
+	if sinceHash == "" {
+		return " (no previous entry exists, so use the most recent commits)"
+	}
+	return fmt.Sprintf(" made after commit %s", sinceHash)
+}
+
+// missingTimestamps reports whether any commit lacks the timestamp that
+// duration calculation depends on.
+func missingTimestamps(commits []models.CommitInfo) bool {
+	for _, c := range commits {
+		if c.Timestamp.IsZero() {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *ClockworkServer) registerUpdateEntry() {

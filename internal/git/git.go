@@ -3,6 +3,7 @@ package git
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -26,6 +27,49 @@ func runGit(repoPath string, args ...string) ([]byte, error) {
 		return nil, fmt.Errorf("git %s timed out after %s", args[0], gitTimeout)
 	}
 	return out, err
+}
+
+// IsRepo reports whether path is a directory that git recognises as a working
+// tree. It is the single check every layer should use before treating a path
+// as a local commit source.
+func IsRepo(path string) error {
+	if path == "" {
+		return fmt.Errorf("path is empty")
+	}
+
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("failed to resolve repo path: %w", err)
+	}
+
+	info, err := os.Stat(absPath)
+	if err != nil {
+		return fmt.Errorf("path not accessible: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("path is not a directory")
+	}
+
+	if _, err := runGit(absPath, "rev-parse", "--git-dir"); err != nil {
+		return fmt.Errorf("not a git repository")
+	}
+	return nil
+}
+
+// NewestCommit returns the most recent commit by timestamp. Commits supplied
+// by a client arrive in no guaranteed order, so ordering is not assumed.
+func NewestCommit(commits []models.CommitInfo) (models.CommitInfo, bool) {
+	if len(commits) == 0 {
+		return models.CommitInfo{}, false
+	}
+
+	newest := commits[0]
+	for _, c := range commits[1:] {
+		if c.Timestamp.After(newest.Timestamp) {
+			newest = c
+		}
+	}
+	return newest, true
 }
 
 // GetCommitsSince retrieves commits from the repository since a specific commit hash

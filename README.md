@@ -51,7 +51,7 @@
 
 ### 🔧 Project Management
 - **Multi-Project Support** - Track time across unlimited projects
-- **Git Repository Integration** - Each project linked to a git repo
+- **Flexible Commit Sources** - Each project chooses how its commits are found: none, a local git repo, or supplied by an MCP client
 - **Invoice Tracking** - Mark entries as invoiced for billing
 - **Advanced Filtering** - By project, date range, or invoice status
 
@@ -222,10 +222,11 @@ Apply filters in entries or statistics views:
 | Tool | Description | Example |
 |------|-------------|---------|
 | `create_project` | Create a new project | Create project "API Server" at `/code/api` |
+| `get_commit_baseline` | Show a project's source and last commit hash | What commit should I start from? |
 | `update_project` | Update project details | Rename project to "API v2" |
 | `delete_project` | Delete project and all entries | Delete the API project |
 | `list_projects` | List all projects | Show all my projects |
-| `create_entry` | Create worklog from git commits | Track 2 hours on the API project |
+| `create_entry` | Create worklog from commits or manually | Track 2 hours on the API project |
 | `update_entry` | Update entry details | Mark last entry as invoiced |
 | `delete_entry` | Delete an entry | Delete yesterday's entry |
 | `list_entries` | List project entries with filters | Show uninvoiced entries from last month |
@@ -249,16 +250,42 @@ Apply filters in entries or statistics views:
 #### Programmatic API
 
 ```javascript
-// Create a project
+// Create a project backed by a local git repository
 create_project({
   name: "My Project",
+  source_type: "local",
   git_repo_path: "/absolute/path/to/repo"
 })
 
-// Create entry from git commits (automatic)
+// Create a project with no repository at all (manual entries only)
+create_project({
+  name: "Consulting",
+  source_type: "none"
+})
+
+// Create a project whose commits you look up yourself
+create_project({
+  name: "Remote App",
+  source_type: "mcp",
+  repository: "owner/remote-app"
+})
+
+// Create entry from git commits (source_type "local", automatic)
 create_entry({
   project_id: "project-uuid",
   invoiced: false
+})
+
+// Create entry from commits you fetched yourself (source_type "mcp")
+get_commit_baseline({ project_id: "project-uuid" })
+// → { source_type: "mcp", repository: "owner/remote-app", last_commit_hash: "abc123..." }
+
+create_entry({
+  project_id: "project-uuid",
+  commits: [
+    { hash: "3f2a91c...", author: "Alex", message: "feat: add widget",
+      timestamp: "2026-07-20T09:00:00Z" }
+  ]
 })
 
 // Create manual entry (no git aggregation)
@@ -330,7 +357,7 @@ update_entry({
 ```
 ~/.local/clockwork/default.db (bbolt)
 ├── projects/
-│   └── <uuid> → {id, name, git_repo_path, created_at, updated_at}
+│   └── <uuid> → {id, name, source_type, git_repo_path?, repository?, created_at, updated_at}
 └── entries/
     └── <uuid> → {id, project_id, duration, message, commit_hash, invoiced, created_at, updated_at}
 ```
@@ -343,6 +370,7 @@ update_entry({
 {
   "id": "550e8400-e29b-41d4-a716-446655440000",
   "name": "Website Redesign",
+  "source_type": "local",
   "git_repo_path": "/home/user/projects/website",
   "created_at": "2025-01-27T10:00:00Z",
   "updated_at": "2025-01-27T10:00:00Z"
@@ -452,11 +480,33 @@ GOOS=windows GOARCH=amd64 go build -o clockwork.exe ./cmd/clockwork
 **Error**: `failed to open database: timeout`
 **Solution**: Stop the other mode before starting a new one
 
-### Git Repository Requirements
+### Commit Sources
 
-- Each project must point to a valid git repository
-- Repository must have at least one commit
+A repository is optional. Each project declares a `source_type`:
+
+| `source_type` | Locator field | Where commits come from |
+|---------------|---------------|-------------------------|
+| `none` | — | Nowhere. Only manual entries are possible. |
+| `local` | `git_repo_path` | A git repository on this machine, read by clockwork with the git CLI. |
+| `mcp` | `repository` | Clockwork does not look them up. The calling client — typically an AI with access to a repository MCP server or API — fetches them and passes them to `create_entry` in the `commits` array. |
+
+Projects created before `source_type` existed are read as `local` when they
+have a repository path and `none` when they do not, so no migration is needed.
+
+For `source_type: "local"`:
+
+- The path must be a valid git repository
+- The repository must have at least one commit
 - Git must be accessible in the system PATH
+
+For `source_type: "mcp"`:
+
+- Call `get_commit_baseline` to learn the last recorded commit hash
+- Fetch the commits made after it using your own tooling
+- Pass them to `create_entry`; each commit needs a `message`, and a
+  `timestamp` unless you also pass an explicit `duration`
+- The TUI cannot create git-mode entries for these projects, since no client
+  is present to supply the commits — use manual entries there
 
 ## 🐛 Troubleshooting
 

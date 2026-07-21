@@ -83,19 +83,52 @@ The server auto-creates its database at `~/.local/clockwork/default.db` on first
 
 ## Architecture
 
+### Commit Sources
+
+A project's repository is optional, and when present it is not necessarily a
+local one. `internal/source` defines the lookup method via `Project.SourceType`:
+
+| Type | Locator | Behavior |
+|------|---------|----------|
+| `none` | — | No repository. Commit aggregation is refused; manual entries only. |
+| `local` | `GitRepoPath` | Clockwork shells out to git itself (the original behavior). |
+| `mcp` | `Repository` | Clockwork makes **no** outbound calls. The caller supplies commits in the `commits` argument of `create_entry`. |
+
+Key invariants:
+
+- `source.Resolve(project)` is the only correct way to read a project's type.
+  It infers a type for rows written before `source_type` existed (`local` if a
+  path is set, else `none`), so legacy databases need no migration. The db
+  layer normalizes on read via `normalizeProject`.
+- `source.Validate` enforces that exactly the locator matching the type is set.
+  It performs no I/O — filesystem checks belong to the server/TUI layer, which
+  call `git.IsRepo`.
+- `UpdateProject` clears the locator that no longer applies when the type
+  changes, so a project can move between methods cleanly.
+- The TUI can only drive `local` projects in git mode; there is no client
+  present to supply commits for `mcp` ones. `App.localProjects()` filters
+  accordingly and the mode selector falls through to manual when none exist.
+
 ### Data Flow for Entry Creation
 
-The core workflow aggregates git commits into worklog entries:
+The core workflow aggregates commits into worklog entries:
 
-1. **Retrieve last entry's commit hash** (`store.GetLastEntry`) - establishes baseline
-2. **Fetch commits since that hash** (`git.GetCommitsSince`) - uses `git log <hash>..HEAD`
-3. **Aggregate commit messages** (`git.AggregateCommits`) - formats into summary
-4. **Calculate duration** (`git.CalculateDuration`) - single commit = 30min, multiple = time span + 30min buffer
-5. **Store entry with latest commit hash** (`store.CreateEntry`) - becomes next baseline
+1. **Resolve the project's source type** (`source.Resolve`) - decides steps 2-3
+2. **Retrieve last entry's commit hash** (`store.GetLastCommitHash`) - establishes baseline
+3. **Obtain commits since that hash**:
+   - `local`: `git.GetCommitsSince` runs `git log <hash>..HEAD`; a baseline that
+     no longer exists (rebase, force push) is discarded rather than failing
+   - `mcp`: the caller passes them in; absent that, the tool returns an error
+     that tells the caller which repository and baseline hash to fetch from
+4. **Aggregate commit messages** (`git.AggregateCommits`) - formats into summary
+5. **Calculate duration** (`git.CalculateDuration`) - single commit = 30min, multiple = time span + 30min buffer
+6. **Store entry with latest commit hash** (`store.CreateEntry`) - becomes next baseline.
+   For `local` this is HEAD; for `mcp` it is `git.NewestCommit` of the supplied
+   set, since caller-supplied commits arrive in no guaranteed order.
 
 ### MCP Tool Registration
 
-`internal/server/server.go` implements 8 MCP tools via the mcp-go library (v0.9.0):
+`internal/server/server.go` implements 10 MCP tools via the mcp-go library:
 
 - Tool definitions use `mcp.NewTool()` with schema descriptors
 - Handlers access arguments via `request.Params.Arguments` (map[string]interface{})
@@ -103,14 +136,24 @@ The core workflow aggregates git commits into worklog entries:
 - Errors returned as `mcp.NewToolResultError(string)`
 - Success returns `mcp.NewToolResultText(string)` with JSON-marshaled data
 
-**Project tools:** create_project, update_project, delete_project, list_projects
-**Entry tools:** create_entry, update_entry, delete_entry, list_entries
+**Project tools:** create_project, update_project, delete_project, list_projects, get_commit_baseline
+**Entry tools:** create_entry, update_entry, delete_entry, list_entries, get_statistics
+
+`create_project`/`update_project` take an optional `source_type` plus one of
+`git_repo_path` or `repository`. `update_project` uses presence-based partial
+updates (`db.ProjectUpdate` with `*string` fields), so passing an empty string
+clears a field — this is why it does not use the old "non-empty wins" sentinel.
+
+`create_entry` accepts a `commits` array for `mcp` projects. Timestamps are
+parsed leniently (RFC3339 or unix seconds); a missing timestamp is only an
+error when duration must be derived from the commit span.
 
 ### Database Layer
 
 **bbolt** key-value store at `~/.local/clockwork/default.db`:
 
 - Two buckets: `projects` and `entries`
+- `CreateProject` takes `db.ProjectInput`; `UpdateProject` takes `db.ProjectUpdate`
 - All operations wrapped in transactions (`db.Update`, `db.View`)
 - Data stored as JSON-marshaled bytes with UUID keys
 - `GetLastEntry()` iterates entries, filters by project_id, returns most recent by created_at
@@ -225,7 +268,7 @@ After building, launch the TUI:
 
 **Quick Start:**
 1. Press `n` in Projects view to create first project
-2. Enter project name and git repository path
+2. Enter project name, pick a Source (`none`/`local`/`mcp`), and fill the matching locator field
 3. Press `Enter` on project to view entries
 4. Press `n` to create entry (choose Git or Manual mode)
 5. Git mode: automatically aggregates commits since last entry
