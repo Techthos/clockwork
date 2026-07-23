@@ -1,50 +1,52 @@
 name: Build and Release
 
+# CI on push/PR lives in ci.yml; this workflow only handles version tags:
+# re-run the tests as a release gate, cross-compile in a matrix, then publish
+# all binaries from a single job (a per-matrix-job release creation races —
+# every leg tries to create the release for the tag at once).
 on:
   push:
-    branches:
-      - main
-    tags:
-      - 'v*'
-  pull_request:
-    branches:
-      - main
+    tags: ['v*']
 
+# Least privilege by default; the release job elevates locally.
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
-          go-version: '1.23'
+          go-version-file: go.mod
+          cache: true
 
       - name: Download dependencies
         run: go mod download
 
       - name: Run tests
-        run: go test -v ./...
+        run: go test -race -v ./...
 
       - name: Build
-        # Match the release build's linkage so a dependency that quietly needs
-        # cgo fails here rather than in a release artifact.
-        env:
-          CGO_ENABLED: 0
-        run: go build -v ./cmd/clockwork
+        run: go build -v .
 
-  release:
-    name: Release
+  build:
+    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
     needs: test
-    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
         goos: [linux, darwin, windows]
         goarch: [amd64, arm64]
@@ -53,52 +55,57 @@ jobs:
             goarch: arm64
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        uses: actions/checkout@v6
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
-          go-version: '1.23'
+          go-version-file: go.mod
+          cache: true
 
       - name: Get version
         id: version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
 
       - name: Build binary
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          # Go only disables cgo automatically when CROSS-compiling. The runner
-          # is linux/amd64, so that one matrix cell was a native build with the
-          # default CGO_ENABLED=1 and came out dynamically linked against the
-          # runner's glibc — unusable on musl targets (Alpine containers), which
-          # fail with a misleading "not found" for the missing ELF interpreter.
-          # Pinning 0 makes every cell a static binary with no libc dependency.
-          CGO_ENABLED: 0
+          CGO_ENABLED: '0'
+          VERSION: ${{ steps.version.outputs.VERSION }}
+          REPO_NAME: ${{ github.event.repository.name }}
         run: |
-          BINARY_NAME="clockwork-${{ steps.version.outputs.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}"
-          if [ "${{ matrix.goos }}" = "windows" ]; then
-            BINARY_NAME="${BINARY_NAME}.exe"
-          fi
-          go build -ldflags="-s -w" -o "${BINARY_NAME}" ./cmd/clockwork
-
-      - name: Create checksum
-        run: |
-          BINARY_NAME="clockwork-${{ steps.version.outputs.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}"
-          if [ "${{ matrix.goos }}" = "windows" ]; then
-            BINARY_NAME="${BINARY_NAME}.exe"
-          fi
+          BINARY_NAME="${REPO_NAME}-${VERSION}-${GOOS}-${GOARCH}"
+          [ "${GOOS}" = "windows" ] && BINARY_NAME="${BINARY_NAME}.exe"
+          go build -trimpath -ldflags="-s -w" -o "${BINARY_NAME}" .
           sha256sum "${BINARY_NAME}" > "${BINARY_NAME}.sha256"
 
-      - name: Upload to release
-        uses: softprops/action-gh-release@v2
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
         with:
-          files: |
-            clockwork-${{ steps.version.outputs.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}*
+          name: ${{ github.event.repository.name }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ${{ github.event.repository.name }}-*
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # required to create the release / upload assets
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2
+        with:
+          files: dist/*
           draft: false
           prerelease: false
           generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
