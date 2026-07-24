@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
@@ -20,11 +19,12 @@ import (
 
 // ClockworkServer represents the MCP server for time tracking
 type ClockworkServer struct {
-	store *db.Store
-	mcp   *server.MCPServer
+	store   *db.Store
+	mcp     *server.MCPServer
+	widgets *widgets
 }
 
-// New creates a new Clockwork MCP server
+// New creates a new Clockwork MCP server backed by the default database.
 func New() (*ClockworkServer, error) {
 	dbPath, err := db.DefaultPath()
 	if err != nil {
@@ -36,10 +36,22 @@ func New() (*ClockworkServer, error) {
 		return nil, fmt.Errorf("failed to initialize database: %w", err)
 	}
 
+	return NewWithStore(store), nil
+}
+
+// NewWithStore creates a Clockwork MCP server on an existing store. Tests use
+// it to run against a temporary database.
+func NewWithStore(store *db.Store) *ClockworkServer {
 	// Create MCP server
 	mcpServer := server.NewMCPServer(
 		"clockwork",
 		"1.0.0",
+		server.WithToolCapabilities(true),
+		// The ui:// widget templates are served as resources; the server
+		// neither supports subscriptions nor mutates the resource list.
+		server.WithResourceCapabilities(false, false),
+		server.WithRecovery(),
+		server.WithLogging(),
 		server.WithInstructions(`Automatically track work time based on the commits of a project.
 
 A repository is optional. Each project declares how its commits are found via
@@ -62,10 +74,12 @@ Examples:
 		mcp:   mcpServer,
 	}
 
-	// Register tools
+	// Widgets first: registering a tool links it to an already rendered
+	// widget template via _meta.ui.resourceUri.
+	cs.registerWidgets()
 	cs.registerTools()
 
-	return cs, nil
+	return cs
 }
 
 // Close closes the server and database connection
@@ -114,6 +128,24 @@ func optionalString(args map[string]interface{}, key string) *string {
 		return nil
 	}
 	return &str
+}
+
+// optionalInt reads a numeric argument, returning 0 when it is absent or not a
+// number. JSON numbers arrive as float64; a digit string is accepted too, since
+// hosts differ in how they type widget-supplied arguments. Range handling
+// (defaults, clamping) belongs to the query, not here.
+func optionalInt(args map[string]interface{}, key string) int {
+	switch v := args[key].(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case string:
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			return n
+		}
+	}
+	return 0
 }
 
 // parseCommitTimestamp accepts either an RFC3339 string or unix seconds, since
@@ -178,20 +210,23 @@ func parseSuppliedCommits(raw interface{}) ([]models.CommitInfo, error) {
 	return commits, nil
 }
 
-// jsonResult marshals v to indented JSON and wraps it in an MCP tool result.
-// If marshaling fails, an error result is returned instead of silently
-// emitting invalid JSON.
+// jsonResult wraps v as a JSON tool result. It is for the tools that have no
+// widget (get_commit_baseline, get_statistics) — widget-backed tools return
+// structuredContent plus a one-line status instead, so no raw JSON flashes in
+// the host before the widget paints. A marshaling failure surfaces as a tool
+// error rather than invalid JSON.
 func jsonResult(v interface{}) *mcp.CallToolResult {
-	data, err := json.MarshalIndent(v, "", "  ")
+	res, err := mcp.NewToolResultJSON(v)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to marshal response: %v", err))
 	}
-	return mcp.NewToolResultText(string(data))
+	return res
 }
 
-// Serve starts the MCP server using stdio transport
-func (s *ClockworkServer) Serve() error {
-	return server.ServeStdio(s.mcp)
+// MCP exposes the underlying MCP server so the caller (cmd/) can attach the
+// transport of its choice. Transport selection does not belong in this package.
+func (s *ClockworkServer) MCP() *server.MCPServer {
+	return s.mcp
 }
 
 func (s *ClockworkServer) registerTools() {
@@ -209,6 +244,13 @@ func (s *ClockworkServer) registerTools() {
 	s.registerDeleteEntry()
 	s.registerListEntries()
 	s.registerGetStatistics()
+
+	// Form tools: they render the create/edit widgets and hydrate them with
+	// prefill values. The forms submit to the CRUD tools above.
+	s.registerNewProjectForm()
+	s.registerEditProjectForm()
+	s.registerNewEntryForm()
+	s.registerEditEntryForm()
 }
 
 // sourceTypeDescription documents the lookup methods for the tool schemas.
@@ -231,6 +273,7 @@ func (s *ClockworkServer) registerCreateProject() {
 		mcp.WithString("git_repo_path", mcp.Description("Path to a git repository on this filesystem. Only for source_type 'local'.")),
 		mcp.WithString("repository", mcp.Description("Repository identifier you will use to look up commits yourself, e.g. 'owner/name' or a clone URL. Only for source_type 'mcp'.")),
 	)
+	linkWidget(&tool, s.widgets.projects)
 
 	s.mcp.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		name, err := getRequiredString(request, "name")
@@ -243,11 +286,20 @@ func (s *ClockworkServer) registerCreateProject() {
 		gitRepoPath, _ := args["git_repo_path"].(string)
 		repository, _ := args["repository"].(string)
 
+		// Entered values for the inline form shown on validation errors.
+		formValues := map[string]interface{}{
+			"name":          name,
+			"source_type":   sourceType,
+			"git_repo_path": gitRepoPath,
+			"repository":    repository,
+		}
+
 		resolved := source.Infer(gitRepoPath, repository)
 		if sourceType != "" {
 			parsed, err := source.Parse(sourceType)
 			if err != nil {
-				return mcp.NewToolResultError(err.Error()), nil
+				return s.formError(s.widgets.projectCreate, err.Error(), formValues,
+					map[string]string{"source_type": err.Error()}), nil
 			}
 			resolved = parsed
 		}
@@ -256,7 +308,9 @@ func (s *ClockworkServer) registerCreateProject() {
 		// only one whose locator can be checked here.
 		if resolved == source.Local {
 			if err := git.IsRepo(gitRepoPath); err != nil {
-				return mcp.NewToolResultError(fmt.Sprintf("git_repo_path is not usable: %v", err)), nil
+				msg := fmt.Sprintf("git_repo_path is not usable: %v", err)
+				return s.formError(s.widgets.projectCreate, msg, formValues,
+					map[string]string{"git_repo_path": msg}), nil
 			}
 		}
 
@@ -270,7 +324,8 @@ func (s *ClockworkServer) registerCreateProject() {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		return jsonResult(project), nil
+		return s.projectsResult(fmt.Sprintf("Project %q created.", project.Name),
+			map[string]interface{}{"project": project}), nil
 	})
 }
 
@@ -286,6 +341,7 @@ func (s *ClockworkServer) registerUpdateProject() {
 		mcp.WithString("git_repo_path", mcp.Description("New git repository path (optional). Pass an empty string to clear it.")),
 		mcp.WithString("repository", mcp.Description("New repository identifier (optional). Pass an empty string to clear it.")),
 	)
+	linkWidget(&tool, s.widgets.projects)
 
 	s.mcp.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id, err := getRequiredString(request, "id")
@@ -308,7 +364,25 @@ func (s *ClockworkServer) registerUpdateProject() {
 
 		if upd.GitRepoPath != nil && *upd.GitRepoPath != "" {
 			if err := git.IsRepo(*upd.GitRepoPath); err != nil {
-				return mcp.NewToolResultError(fmt.Sprintf("git_repo_path is not usable: %v", err)), nil
+				msg := fmt.Sprintf("git_repo_path is not usable: %v", err)
+				// Prefill from the stored project first: updates are
+				// presence-based and text fields always submit, so a field
+				// left empty in the form would otherwise clear the stored
+				// value on resubmit.
+				formValues := map[string]interface{}{"id": id}
+				if project, lookupErr := s.store.GetProject(id); lookupErr == nil {
+					formValues = projectValues(project)
+				}
+				for key, val := range map[string]*string{
+					"name": upd.Name, "source_type": upd.SourceType,
+					"git_repo_path": upd.GitRepoPath, "repository": upd.Repository,
+				} {
+					if val != nil {
+						formValues[key] = *val
+					}
+				}
+				return s.formError(s.widgets.projectEdit, msg, formValues,
+					map[string]string{"git_repo_path": msg}), nil
 			}
 		}
 
@@ -317,7 +391,8 @@ func (s *ClockworkServer) registerUpdateProject() {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		return jsonResult(project), nil
+		return s.projectsResult(fmt.Sprintf("Project %q updated.", project.Name),
+			map[string]interface{}{"project": project}), nil
 	})
 }
 
@@ -363,6 +438,7 @@ func (s *ClockworkServer) registerDeleteProject() {
 		mcp.WithDescription("Delete a project and all its entries"),
 		mcp.WithString("id", mcp.Required(), mcp.Description("Project ID")),
 	)
+	linkWidget(&tool, s.widgets.projects)
 
 	s.mcp.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id, err := getRequiredString(request, "id")
@@ -374,7 +450,7 @@ func (s *ClockworkServer) registerDeleteProject() {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		return mcp.NewToolResultText(fmt.Sprintf("Project %s deleted successfully", id)), nil
+		return s.projectsResult(fmt.Sprintf("Project %s deleted.", id), nil), nil
 	})
 }
 
@@ -382,6 +458,7 @@ func (s *ClockworkServer) registerListProjects() {
 	tool := mcp.NewTool("list_projects",
 		mcp.WithDescription("List all projects"),
 	)
+	linkWidget(&tool, s.widgets.projects)
 
 	s.mcp.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		projects, err := s.store.ListProjects()
@@ -389,8 +466,17 @@ func (s *ClockworkServer) registerListProjects() {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		return jsonResult(projects), nil
+		return s.rowsResult(s.widgets.projects, pluralize(len(projects), "project", "projects")+".",
+			rowsOrLog(projects), nil), nil
 	})
+}
+
+// pluralize renders a count for the widget's one-line status banner.
+func pluralize(n int, singular, plural string) string {
+	if n == 1 {
+		return fmt.Sprintf("1 %s", singular)
+	}
+	return fmt.Sprintf("%d %s", n, plural)
 }
 
 func (s *ClockworkServer) registerCreateEntry() {
@@ -416,6 +502,7 @@ func (s *ClockworkServer) registerCreateEntry() {
 			}),
 		),
 	)
+	linkWidget(&tool, s.widgets.entries)
 
 	s.mcp.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		projectID, err := getRequiredString(request, "project_id")
@@ -450,13 +537,23 @@ func (s *ClockworkServer) registerCreateEntry() {
 
 		// Manual entry path
 		if manual {
+			formValues := map[string]interface{}{
+				"project_id": projectID,
+				"duration":   durationStr,
+				"message":    customMessage,
+				"invoiced":   invoiced,
+			}
 			if durationStr == "" {
-				return mcp.NewToolResultError("duration is required when manual=true"), nil
+				msg := "duration is required when manual=true"
+				return s.formError(s.widgets.entryCreate, msg, formValues,
+					map[string]string{"duration": msg}), nil
 			}
 
 			duration, err := utils.ParseDuration(durationStr)
 			if err != nil {
-				return mcp.NewToolResultError(fmt.Sprintf("invalid duration: %v", err)), nil
+				msg := fmt.Sprintf("invalid duration: %v", err)
+				return s.formError(s.widgets.entryCreate, msg, formValues,
+					map[string]string{"duration": msg}), nil
 			}
 
 			message := customMessage
@@ -481,10 +578,11 @@ func (s *ClockworkServer) registerCreateEntry() {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 
-			return jsonResult(map[string]interface{}{
-				"entry": entry,
-				"mode":  "manual",
-			}), nil
+			return s.entriesResult(
+				fmt.Sprintf("Logged %d minutes to %s.", duration, project.Name),
+				projectID,
+				map[string]interface{}{"entry": entry, "mode": "manual"},
+			), nil
 		}
 
 		// Commit-based entry path. Where the commits come from depends entirely
@@ -579,12 +677,16 @@ func (s *ClockworkServer) registerCreateEntry() {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		return jsonResult(map[string]interface{}{
-			"entry":         entry,
-			"commits_found": len(commits),
-			"mode":          "git",
-			"source_type":   srcType.String(),
-		}), nil
+		return s.entriesResult(
+			fmt.Sprintf("Logged %d minutes to %s from %s.", duration, project.Name, pluralize(len(commits), "commit", "commits")),
+			projectID,
+			map[string]interface{}{
+				"entry":         entry,
+				"commits_found": len(commits),
+				"mode":          "git",
+				"source_type":   srcType.String(),
+			},
+		), nil
 	})
 }
 
@@ -619,6 +721,7 @@ func (s *ClockworkServer) registerUpdateEntry() {
 		mcp.WithBoolean("invoiced", mcp.Description("Update invoiced status (optional)")),
 		mcp.WithString("created_at", mcp.Description("Update entry creation datetime in RFC3339 format (optional, e.g., '2026-01-15T14:30:00Z')")),
 	)
+	linkWidget(&tool, s.widgets.entries)
 
 	s.mcp.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id, err := getRequiredString(request, "id")
@@ -636,7 +739,16 @@ func (s *ClockworkServer) registerUpdateEntry() {
 		if durationStr, ok := args["duration_string"].(string); ok && durationStr != "" {
 			parsed, err := utils.ParseDuration(durationStr)
 			if err != nil {
-				return mcp.NewToolResultError(fmt.Sprintf("invalid duration_string: %v", err)), nil
+				msg := fmt.Sprintf("invalid duration_string: %v", err)
+				// Prefill from the stored entry so a resubmit from the form
+				// keeps the fields the user did not touch.
+				values := map[string]interface{}{"id": id}
+				if entry, lookupErr := s.store.GetEntry(id); lookupErr == nil {
+					values = entryValues(entry)
+				}
+				values["duration_string"] = durationStr
+				return s.formError(s.widgets.entryEdit, msg, values,
+					map[string]string{"duration_string": msg}), nil
 			}
 			duration = &parsed
 		} else if d, ok := args["duration"].(float64); ok {
@@ -672,7 +784,8 @@ func (s *ClockworkServer) registerUpdateEntry() {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		return jsonResult(entry), nil
+		return s.entriesResult(fmt.Sprintf("Entry %s updated.", entry.ID), entry.ProjectID,
+			map[string]interface{}{"entry": entry}), nil
 	})
 }
 
@@ -681,6 +794,7 @@ func (s *ClockworkServer) registerDeleteEntry() {
 		mcp.WithDescription("Delete a worklog entry"),
 		mcp.WithString("id", mcp.Required(), mcp.Description("Entry ID")),
 	)
+	linkWidget(&tool, s.widgets.entries)
 
 	s.mcp.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id, err := getRequiredString(request, "id")
@@ -688,22 +802,37 @@ func (s *ClockworkServer) registerDeleteEntry() {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
+		// Look the entry up first so the refreshed widget can stay scoped to
+		// its project; a lookup failure only widens the widget's scope.
+		scope := ""
+		if entry, lookupErr := s.store.GetEntry(id); lookupErr == nil {
+			scope = entry.ProjectID
+		}
+
 		if err := s.store.DeleteEntry(id); err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		return mcp.NewToolResultText(fmt.Sprintf("Entry %s deleted successfully", id)), nil
+		return s.entriesResult(fmt.Sprintf("Entry %s deleted.", id), scope, nil), nil
 	})
 }
 
 func (s *ClockworkServer) registerListEntries() {
 	tool := mcp.NewTool("list_entries",
-		mcp.WithDescription("List entries with optional filtering"),
+		mcp.WithDescription("List entries with optional filtering, search, ordering and pagination"),
 		mcp.WithString("project_id", mcp.Description("Project ID (optional, omit for all projects)")),
 		mcp.WithString("start_date", mcp.Description("RFC3339 format (optional, e.g., '2026-01-01T00:00:00Z')")),
 		mcp.WithString("end_date", mcp.Description("RFC3339 format (optional)")),
 		mcp.WithString("invoiced", mcp.Description("Filter: 'true', 'false', or 'all' (default: 'all')")),
+		mcp.WithString("search", mcp.Description("Case-insensitive substring matched against message, commit hash and project name")),
+		mcp.WithString("sort_by", mcp.Enum(sortEnum()...),
+			mcp.Description("Order by (default: 'created_at')")),
+		mcp.WithString("order", mcp.Enum("desc", "asc"),
+			mcp.Description("Sort direction (default: 'desc', newest/largest first)")),
+		mcp.WithNumber("page", mcp.Description("1-based page number (default: 1)")),
+		mcp.WithNumber("page_size", mcp.Description(fmt.Sprintf("Entries per page, clamped to %d (default: %d)", db.MaxEntryPageSize, db.MaxEntryPageSize))),
 	)
+	linkWidget(&tool, s.widgets.entries)
 
 	s.mcp.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := argsMap(request)
@@ -712,6 +841,9 @@ func (s *ClockworkServer) registerListEntries() {
 		startDateStr, _ := args["start_date"].(string)
 		endDateStr, _ := args["end_date"].(string)
 		invoicedStr, _ := args["invoiced"].(string)
+		search, _ := args["search"].(string)
+		sortBy, _ := args["sort_by"].(string)
+		order, _ := args["order"].(string)
 
 		// Parse start date
 		var startDate *time.Time
@@ -748,13 +880,60 @@ func (s *ClockworkServer) registerListEntries() {
 			invoicedFilter = &val
 		}
 
-		entries, err := s.store.ListEntriesFiltered(projectID, startDate, endDate, invoicedFilter)
+		if order != "" && order != "asc" && order != "desc" {
+			return mcp.NewToolResultError(fmt.Sprintf("invalid order %q (want 'asc' or 'desc')", order)), nil
+		}
+
+		page, err := s.store.QueryEntries(db.EntryQuery{
+			ProjectID: projectID,
+			StartDate: startDate,
+			EndDate:   endDate,
+			Invoiced:  invoicedFilter,
+			Search:    search,
+			SortBy:    db.EntrySort(sortBy),
+			Asc:       order == "asc",
+			Page:      optionalInt(args, "page"),
+			PageSize:  optionalInt(args, "page_size"),
+		})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		return jsonResult(entries), nil
+		return s.rowsResult(s.widgets.entries, entryPageStatus(page), rowsOrLog(page.Entries),
+			map[string]interface{}{
+				"page":        page.Page,
+				"page_size":   page.PageSize,
+				"total":       page.Total,
+				"total_pages": page.TotalPages,
+				"has_more":    page.HasMore,
+			}), nil
 	})
+}
+
+// sortEnum lists the accepted sort_by values for the tool schema.
+func sortEnum() []string {
+	sorts := db.EntrySorts()
+	values := make([]string, 0, len(sorts))
+	for _, s := range sorts {
+		values = append(values, string(s))
+	}
+	return values
+}
+
+// entryPageStatus is the one-line banner for a page of entries: what the
+// caller is looking at and whether there is more behind it.
+func entryPageStatus(page db.EntryPage) string {
+	if page.Total == 0 {
+		return "No entries."
+	}
+	first := (page.Page-1)*page.PageSize + 1
+	last := first + len(page.Entries) - 1
+	if len(page.Entries) == 0 {
+		return fmt.Sprintf("Page %d is past the last of %s (%d page(s)).",
+			page.Page, pluralize(page.Total, "entry", "entries"), page.TotalPages)
+	}
+	return fmt.Sprintf("Showing %d-%d of %s (page %d of %d).",
+		first, last, pluralize(page.Total, "entry", "entries"), page.Page, page.TotalPages)
 }
 
 func (s *ClockworkServer) registerGetStatistics() {

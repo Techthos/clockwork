@@ -1,4 +1,6 @@
 # Binaries
+/bin/
+/clockwork
 *.exe
 *.exe~
 *.dll
@@ -17,6 +19,9 @@ go.work
 # Database files
 *.db
 .local/
+
+# Local tooling state
+.claude/.mcp-save.json
 
 # IDE
 .vscode/

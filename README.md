@@ -75,19 +75,22 @@
 git clone https://github.com/techthos/clockwork.git
 cd clockwork
 
-# Build the binary
-go build -o clockwork ./cmd/clockwork
+# Build the static binary to ./bin/clockwork
+make build
 
 # Or install to $GOPATH/bin
-go install ./cmd/clockwork
+make install
 ```
 
 ### Verify Installation
 
 ```bash
 # The binary supports two modes
-./clockwork          # Starts terminal UI (default)
-./clockwork mcp      # Starts MCP server
+./bin/clockwork      # Starts terminal UI (default)
+./bin/clockwork mcp      # Starts MCP server
+
+# Either mode can point at a specific database file
+./bin/clockwork --db /path/to/clockwork.db
 ```
 
 ## ⚡ Quick Start
@@ -139,7 +142,7 @@ You: "Track the work I did today on the website project"
 #### 1. Launch the TUI
 
 ```bash
-./clockwork
+./bin/clockwork
 ```
 
 #### 2. Create Your First Project
@@ -229,7 +232,18 @@ Apply filters in entries or statistics views:
 | `create_entry` | Create worklog from commits or manually | Track 2 hours on the API project |
 | `update_entry` | Update entry details | Mark last entry as invoiced |
 | `delete_entry` | Delete an entry | Delete yesterday's entry |
-| `list_entries` | List project entries with filters | Show uninvoiced entries from last month |
+| `list_entries` | List entries with filters, search, ordering, pagination | Show uninvoiced entries from last month |
+| `new_project_form` / `edit_project_form` | Open the interactive project form | Show me a form to add a project |
+| `new_entry_form` / `edit_entry_form` | Open the interactive entry form | Let me fill in an entry by hand |
+
+#### Interactive widgets (MCP Apps)
+
+Hosts that support the MCP Apps extension (`io.modelcontextprotocol/ui`) render the
+project and entry tools as interactive tables and forms. The widgets are registered as
+`ui://clockwork/...` resources and linked from the tool definitions, so tables repaint
+after every create, update or delete, rows carry Edit and Delete actions, and form
+submissions call the same tools the model uses. Hosts without the extension see the
+normal tool results.
 
 #### Natural Language Examples
 
@@ -296,13 +310,19 @@ create_entry({
   invoiced: false
 })
 
-// List entries with filters
+// List entries with filters, search, ordering and pagination
 list_entries({
   project_id: "project-uuid",  // optional, empty = all projects
   start_date: "2025-01-01",    // optional
   end_date: "2025-01-31",      // optional
-  invoiced: false              // optional, null = all entries
+  invoiced: false,             // optional, null = all entries
+  search: "invoice",           // optional, matches message, commit hash, project name
+  sort_by: "created_at",       // optional: created_at | updated_at | duration | message
+  order: "desc",               // optional: desc (default) | asc
+  page: 1,                     // optional, 1-based
+  page_size: 50                // optional, clamped to 50
 })
+// → rows plus page, page_size, total, total_pages, has_more
 
 // Update entry
 update_entry({
@@ -458,27 +478,44 @@ clockwork/
 ### Building for Production
 
 ```bash
-# Build with optimizations
-go build -ldflags="-s -w" -o clockwork ./cmd/clockwork
+# Build with optimizations (static, like release assets)
+CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/clockwork ./cmd/clockwork
 
 # Build for specific platform
-GOOS=linux GOARCH=amd64 go build -o clockwork-linux ./cmd/clockwork
-GOOS=darwin GOARCH=arm64 go build -o clockwork-macos ./cmd/clockwork
-GOOS=windows GOARCH=amd64 go build -o clockwork.exe ./cmd/clockwork
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/clockwork-linux ./cmd/clockwork
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o bin/clockwork-macos ./cmd/clockwork
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o bin/clockwork.exe ./cmd/clockwork
 ```
 
 ## ⚠️ Important Notes
 
 ### Database Locking
 
-**Only one mode can run at a time.** The bbolt database uses a file lock to ensure data integrity.
+**The TUI and the MCP server can run at the same time.** Clockwork opens the bbolt file per
+operation — read-only for reads, read-write for writes — and closes it again, so an idle process
+holds no lock. A collision between the two is retried with backoff (75ms attempts, 3s budget)
+before it is reported.
 
-- ✅ Running TUI mode → MCP mode blocked
-- ✅ Running MCP mode → TUI mode blocked
-- ❌ Cannot run both simultaneously
+- ✅ TUI and MCP server side by side on one database
+- ⚠️ Writes still serialize: the second writer waits for the first to finish its (short) operation
+- ⚠️ The TUI reloads on navigation; it does not auto-refresh when the MCP server writes
 
-**Error**: `failed to open database: timeout`
-**Solution**: Stop the other mode before starting a new one
+**Error**: `open bbolt at "...": timeout` — something held the lock for more than 3 seconds. Check
+for a stuck process on the same file.
+
+Details and trade-offs: [`docs/bbolt-concurrent-access-strategy.md`](docs/bbolt-concurrent-access-strategy.md).
+
+### Database Location
+
+Resolved in one place (`db.DefaultPath()`), highest precedence first:
+
+| Source | Value |
+|---|---|
+| `--db <path>` flag | used verbatim; accepted by both modes (`clockwork --db ...`, `clockwork mcp --db ...`) |
+| `CLOCKWORK_DB` env var | used verbatim (an empty value counts as unset) |
+| default | `~/.local/clockwork/default.db` |
+
+Paths are used exactly as given — the shell expands `~`, clockwork does not.
 
 ### Commit Sources
 

@@ -4,20 +4,18 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 
 	"github.com/techthos/clockwork/internal/db"
 )
 
 func main() {
-	// Get database path
-	home, err := os.UserHomeDir()
+	// Database path comes from the single resolver, so this tool can never
+	// operate on a different file than the TUI and the MCP server.
+	dbPath, err := db.DefaultPath()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to get home directory: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to resolve database path: %v\n", err)
 		os.Exit(1)
 	}
-
-	dbPath := filepath.Join(home, ".local", "clockwork", "default.db")
 
 	// Open database
 	store, err := db.New(dbPath)

@@ -16,23 +16,23 @@ Both modes share the same embedded bbolt database and business logic.
 ## Build and Run Commands
 
 ```bash
-# Build binary
-go build -o clockwork ./cmd/clockwork
+# Build static binary to ./bin/clockwork (CGO_ENABLED=0, see .claude/rules/makefile-rules.md)
+make build
 
 # Install to GOPATH/bin
-go install ./cmd/clockwork
+make install
 
 # Run TUI mode (default)
-./clockwork
+./bin/clockwork
 
 # Run MCP server mode
-./clockwork mcp
+./bin/clockwork mcp
 
-# Run all tests
-go test ./...
+# Either mode against a specific database file (outranks $CLOCKWORK_DB)
+./bin/clockwork --db /path/to/clockwork.db
 
-# Run tests with coverage
-go test -cover ./...
+# Run all tests (race detector + coverage)
+make test
 
 # Run specific package tests
 go test ./internal/db -v
@@ -128,16 +128,19 @@ The core workflow aggregates commits into worklog entries:
 
 ### MCP Tool Registration
 
-`internal/server/server.go` implements 10 MCP tools via the mcp-go library:
+`internal/server/server.go` implements 14 MCP tools via the mcp-go library:
 
 - Tool definitions use `mcp.NewTool()` with schema descriptors
 - Handlers access arguments via `request.Params.Arguments` (map[string]interface{})
 - Required strings extracted via `getRequiredString()` helper
 - Errors returned as `mcp.NewToolResultError(string)`
-- Success returns `mcp.NewToolResultText(string)` with JSON-marshaled data
+- Widget-backed tools return `mcp.NewToolResultStructured(payload, status)`;
+  the two without a widget return JSON (`jsonResult`)
 
 **Project tools:** create_project, update_project, delete_project, list_projects, get_commit_baseline
 **Entry tools:** create_entry, update_entry, delete_entry, list_entries, get_statistics
+**Form tools** (`internal/server/forms.go`, render the create/edit widgets):
+new_project_form, edit_project_form, new_entry_form, edit_entry_form
 
 `create_project`/`update_project` take an optional `source_type` plus one of
 `git_repo_path` or `repository`. `update_project` uses presence-based partial
@@ -148,14 +151,56 @@ clears a field — this is why it does not use the old "non-empty wins" sentinel
 parsed leniently (RFC3339 or unix seconds); a missing timestamp is only an
 error when duration must be derived from the commit span.
 
+### Interactive widget UI (gadget, MCP Apps)
+
+Every CRUD tool also ships an interactive UI per `.claude/rules/mcp-server.md`,
+built with `github.com/techthos/gadget` in **template mode**
+(`internal/server/ui.go`, form tools in `internal/server/forms.go`):
+
+- `registerWidgets()` renders the six widgets once at construction and serves
+  them from memory at stable URIs (`ui://clockwork/projects`, `/entries`,
+  `/project-create-form`, `/project-edit-form`, `/entry-create-form`,
+  `/entry-edit-form`). The registered documents carry no data.
+- `linkWidget(&tool, widget)` sets the tool definition's
+  `_meta.ui.resourceUri` — this, not the tool result, is what makes a host
+  discover the app. Widget order matters: `registerWidgets()` runs before
+  `registerTools()`.
+- Data travels in `structuredContent`: `rows` for tables, `values`/`errors`
+  for forms, alongside a one-line status sentence
+  (`mcp.NewToolResultStructured`). `projectsResult`/`entriesResult` reload the
+  collection so every mutating tool repaints the visible table; `formError`
+  fails a call at the user level while handing the submitting form its inline
+  field errors.
+- Each result also embeds the registered document (same URI, same bytes) as a
+  fallback for hosts that render result-embedded widgets. Widget failures log
+  to stderr and never fail the tool.
+- Only `get_statistics` and `get_commit_baseline` have no widget and return
+  plain JSON (`jsonResult`).
+
+Invoke the `gadget-mcp-ui` skill before touching widget code.
+
 ### Database Layer
 
-**bbolt** key-value store at `~/.local/clockwork/default.db`:
+**bbolt** key-value store at `~/.local/clockwork/default.db` (`internal/db`: `db.go` for the
+connection and bucket plumbing, `projects.go`, `entries.go`, `stats.go` per entity):
 
-- Two buckets: `projects` and `entries`
+- Two buckets, `projects` and `entries`, as package-level `[]byte` names — never inline literals
+- **Connection per operation.** `Store` holds the path, not a handle: `store.view` opens
+  read-only, `store.update` opens read-write, each runs one short transaction and closes.
+  An idle process holds no lock, so the TUI and the MCP server can run concurrently. `New`
+  does the single read-write bootstrap open that creates the file and its buckets.
+  `store.open` retries only `bolterrors.ErrTimeout`, with backoff up to a 3s budget.
+  Nothing slow (git, network, user I/O) may happen inside `view`/`update`.
+  Rationale: `docs/bbolt-concurrent-access-strategy.md`.
+- `Store.Close()` is a no-op kept for caller symmetry; `Store.TxID()` exposes the committed
+  txid so a long-lived reader can detect another process's writes.
 - `CreateProject` takes `db.ProjectInput`; `UpdateProject` takes `db.ProjectUpdate`
-- All operations wrapped in transactions (`db.Update`, `db.View`)
-- Data stored as JSON-marshaled bytes with UUID keys
+- Data stored as JSON-marshaled bytes with UUID keys; values are unmarshaled inside the txn,
+  never retained as raw bbolt slices
+- `QueryEntries(db.EntryQuery) (db.EntryPage, error)` is the paginated/searchable/sortable
+  list query behind `list_entries` (page size clamped to `db.MaxEntryPageSize` = 50, sort
+  tie-broken on id, search resolves project names via `projectNames(tx)`). `ListEntries`,
+  `ListEntriesFiltered` and `GetStatistics` share its filter through `collectEntries`.
 - `GetLastEntry()` iterates entries, filters by project_id, returns most recent by created_at
 - `DeleteProject()` cascades to all associated entries
 
@@ -207,25 +252,31 @@ Projects View (default)
 **TUI vs MCP Mode:**
 - Both use same `db.Store` interface - no database layer changes needed
 - Entry point (`main.go`) runs the TUI by default and checks for the `mcp` argument to run the server
-- Only one mode can run at a time due to bbolt's single-writer file lock
+- Both modes can run at the same time: the store opens the file per operation, so neither holds
+  the lock while idle
 
 ## Key Implementation Details
 
 ### MCP Server Initialization
 
-Entry point (`cmd/clockwork/main.go`) → `server.New()`:
-1. Resolves `~/.local/clockwork/default.db` path
-2. Calls `db.New()` to initialize bbolt store
-3. Creates `server.MCPServer` instance ("clockwork", "1.0.0")
-4. Registers all 8 tools via `registerTools()`
-5. Serves via stdio transport with `server.ServeStdio()`
+Entry point (`cmd/clockwork/main.go`) → `server.NewWithStore(store)`:
+1. `cmd/` resolves the database path (`--db` flag, else `db.DefaultPath()`) and calls `db.New()`,
+   so both modes share one resolution path
+2. Creates `server.MCPServer` instance ("clockwork", "1.0.0") with tool and resource capabilities, logging and panic recovery (`WithRecovery`)
+3. Registers the widget resources via `registerWidgets()`, then all 14 tools via `registerTools()`
+4. `cmd/` selects the transport and serves stdio via `server.ServeStdio(srv.MCP())` — transport selection stays out of `internal/server`
+
+`server.New()` remains for callers that want the server to open the default database itself;
+tests use `NewWithStore` with a `t.TempDir()` database and mcp-go's in-process client.
 
 ### Testing Strategy
 
 - Database tests use `t.TempDir()` for isolation
 - Git tests use static mock data (no actual git commands)
 - Models tests verify struct creation and field access
-- No server integration tests (MCP tools tested via manual client interaction)
+- Server tools are integration-tested through mcp-go's in-process client
+  (`internal/server/ui_test.go`) so registration and (de)serialization are
+  exercised without a transport
 
 ### Error Handling
 
@@ -236,8 +287,9 @@ Entry point (`cmd/clockwork/main.go`) → `server.New()`:
 ## Dependencies
 
 **Core:**
-- **github.com/mark3labs/mcp-go v0.9.0** - MCP protocol (stdio transport)
-- **go.etcd.io/bbolt v1.3.11** - Embedded key-value database
+- **github.com/mark3labs/mcp-go v0.43.x** - MCP protocol (stdio transport)
+- **github.com/techthos/gadget** - embedded MCP Apps / mcp-ui widgets (Table/Form) for the CRUD tools
+- **go.etcd.io/bbolt v1.4.x** - Embedded key-value database
 - **github.com/google/uuid v1.6.0** - UUID generation
 
 **TUI:**
@@ -249,14 +301,18 @@ Entry point (`cmd/clockwork/main.go`) → `server.New()`:
 
 ## Database Location
 
-Production: `~/.local/clockwork/default.db`
-Tests: `t.TempDir()/<testname>.db`
+Production, highest precedence first: the `--db <path>` flag (parsed in `cmd/clockwork`, applies
+to both modes), `$CLOCKWORK_DB` (empty counts as unset), then `~/.local/clockwork/default.db`.
+The default is resolved only by `db.DefaultPath()` — never rebuild the path at a call site,
+including in the `cmd/diagnose` and `cmd/fix-commits` tools.
+Tests: `t.TempDir()/<testname>.db`, always passed in explicitly; a test must never touch the
+resolved path.
 
-**Important Limitation:** Only one instance can hold the database lock at a time (bbolt limitation). This means:
-- Cannot run MCP server and TUI simultaneously
-- Attempting to start TUI while MCP server is running will fail with "timeout" error
-- Attempting to start MCP server while TUI is running will fail with "timeout" error
-- This is by design for data integrity - bbolt ensures single-writer safety
+**Concurrency:** the MCP server and the TUI can run simultaneously — connections are per
+operation, so neither holds the file lock while idle. Writes still serialize (bbolt is
+single-writer), and a lock collision is retried with backoff for up to 3 seconds before it
+fails. The TUI reloads on navigation and does not poll `Store.TxID()` for another process's
+writes.
 
 ## TUI Usage
 

@@ -704,8 +704,8 @@ func TestGetProjectNormalizesLegacyRows(t *testing.T) {
 	// Rows written before source_type existed carry an empty value; reads
 	// should report the method inferred from the locator.
 	project, _ := store.CreateProject(ProjectInput{Name: "Legacy", GitRepoPath: "/repo"})
-	if err := store.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(projectsBucket))
+	if err := store.update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(projectsBucket)
 		var stored models.Project
 		if err := json.Unmarshal(b.Get([]byte(project.ID)), &stored); err != nil {
 			return err
